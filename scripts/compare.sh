@@ -99,16 +99,17 @@ fi
 echo "  reference $REF  input $IN"
 echo
 
-SOCK_A=/tmp/framewire-cmp-a.sock
-SOCK_B=/tmp/framewire-cmp-b.sock
-SHM_A=/framewire-cmp-a
-SHM_B=/framewire-cmp-b
+SOCK_A=/tmp/framewire-cmp-a-$$.sock
+SOCK_B=/tmp/framewire-cmp-b-$$.sock
+SHM_A=/framewire-cmp-a-$$
+SHM_B=/framewire-cmp-b-$$
 PIDS=()
 
 cleanup() {
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
   rm -f "$SOCK_A" "$SOCK_B"
+  rm -f "/dev/shm${SHM_A}" "/dev/shm${SHM_B}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 

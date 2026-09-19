@@ -156,6 +156,8 @@ StreamSnapshot StreamAggregator::Snapshot() const {
   s.producer_drops = consumer_.producer_dropped();
   s.ring_pending = consumer_.PendingCount();
   s.producer_alive = !consumer_.ProducerGone(kProducerStaleNs);
+  s.environment = consumer_.ReadEnvironment();
+  s.geometry_changes = consumer_.geometry_changes();
 
   for (unsigned p = 0; p < pass_count_; ++p) {
     PassView v;
@@ -348,6 +350,43 @@ void Correlator::Reset() {
   use_media_time_ = false;
   media_seen_a_ = false;
   media_seen_b_ = false;
+}
+
+std::map<std::string, std::string> ParseEnvironment(const std::string& text) {
+  std::map<std::string, std::string> out;
+  size_t start = 0;
+  while (start < text.size()) {
+    size_t end = text.find('\n', start);
+    if (end == std::string::npos) end = text.size();
+
+    const std::string line = text.substr(start, end - start);
+    const size_t eq = line.find('=');
+    if (eq != std::string::npos) out[line.substr(0, eq)] = line.substr(eq + 1);
+    start = end + 1;
+  }
+  return out;
+}
+
+std::vector<std::string> EnvironmentMismatches(const std::string& a, const std::string& b) {
+  std::vector<std::string> out;
+  if (a.empty() || b.empty()) return out;
+
+  const auto ea = ParseEnvironment(a);
+  const auto eb = ParseEnvironment(b);
+
+  // only the keys that change what a measurement means. the mpv version and
+  // the display name are recorded for the report but do not by themselves make
+  // two streams incomparable
+  static const char* const kCritical[] = {"vo", "gpu_context", "hwdec", "render", "video"};
+
+  for (const char* key : kCritical) {
+    const auto ia = ea.find(key);
+    const auto ib = eb.find(key);
+    if (ia == ea.end() || ib == eb.end()) continue;
+    if (ia->second == ib->second) continue;
+    out.push_back(std::string(key) + ": a has '" + ia->second + "', b has '" + ib->second + "'");
+  }
+  return out;
 }
 
 std::string FormatNanos(uint64_t ns) {

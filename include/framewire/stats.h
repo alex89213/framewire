@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -71,6 +72,11 @@ struct StreamSnapshot {
   uint64_t checksum_errors = 0;
   uint64_t sequence_gaps = 0;
   bool producer_alive = false;
+
+  // key=value description of where this stream was captured, and how many
+  // times the window changed size while it ran
+  std::string environment;
+  uint32_t geometry_changes = 0;
 
   std::vector<PassView> passes;
   std::vector<uint64_t> spark;  // recent gpu totals, oldest first
@@ -246,5 +252,26 @@ std::string FormatNanos(uint64_t ns);
  *   A compact string such as "-1.23ms".
  */
 std::string FormatSignedNanos(int64_t ns);
+
+/*
+ * Splits a key=value environment block into a map.
+ *
+ * Args:
+ *   text: Newline separated key=value lines.
+ * Returns:
+ *   The parsed pairs.
+ */
+std::map<std::string, std::string> ParseEnvironment(const std::string& text);
+
+/*
+ * Lists the environment keys where two streams disagree.
+ *
+ * Args:
+ *   a: Environment of the first stream.
+ *   b: Environment of the second stream.
+ * Returns:
+ *   One description per differing key that matters for comparability.
+ */
+std::vector<std::string> EnvironmentMismatches(const std::string& a, const std::string& b);
 
 }  // namespace framewire

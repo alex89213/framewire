@@ -217,6 +217,43 @@ void TestCorrelatorPairing() {
   }
 }
 
+void TestEnvironmentComparison() {
+  TEST_CASE("environment parses into keys and values") {
+    const auto env = ParseEnvironment("vo=gpu-next\nrender=1274x716\nempty=\n");
+    CHECK_EQ(env.size(), 3);
+    CHECK(env.at("vo") == "gpu-next");
+    CHECK(env.at("render") == "1274x716");
+    CHECK(env.at("empty").empty());
+
+    CHECK_EQ(ParseEnvironment("").size(), 0);
+    CHECK_EQ(ParseEnvironment("no equals sign here").size(), 0);
+  }
+
+  TEST_CASE("only differences that change the meaning are flagged") {
+    const std::string base = "vo=gpu-next\ngpu_context=waylandvk\nhwdec=no\n"
+                             "render=1274x716\nvideo=637x358\nmpv=v0.41.0\ndisplay=DP-3\n";
+    CHECK_EQ(EnvironmentMismatches(base, base).size(), 0);
+
+    // a different renderer or window size makes two streams incomparable
+    std::string other = base;
+    other.replace(other.find("gpu-next"), 8, "gpu     ");
+    CHECK_EQ(EnvironmentMismatches(base, other).size(), 1);
+
+    std::string resized = base;
+    resized.replace(resized.find("1274x716"), 8, "1920x108");
+    CHECK_EQ(EnvironmentMismatches(base, resized).size(), 1);
+
+    // the display name is recorded for the report but does not by itself make
+    // two measurements mean different things
+    std::string moved = base;
+    moved.replace(moved.find("DP-3"), 4, "DP-9");
+    CHECK_EQ(EnvironmentMismatches(base, moved).size(), 0);
+
+    // nothing to compare when a stream carried no environment at all
+    CHECK_EQ(EnvironmentMismatches(base, "").size(), 0);
+  }
+}
+
 void TestAggregator() {
   TEST_CASE("the aggregator folds ring records into stats") {
     const std::string name = SegmentName("agg");
@@ -301,6 +338,7 @@ int main() {
   std::printf("test_stats\n");
   TestFormatting();
   TestCorrelatorPairing();
+  TestEnvironmentComparison();
   TestAggregator();
   return fwtest::Finish("test_stats");
 }

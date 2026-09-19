@@ -35,8 +35,10 @@ class ShmRegion {
   /*
    * Creates a shared memory object and maps the whole thing.
    *
-   * An existing object with the same name is removed first, so a crashed run
-   * does not block the next one with a stale segment of the wrong size.
+   * The create is exclusive. An existing segment is a caller problem, because
+   * silently removing one would destroy a ring that another producer is still
+   * writing to, and that producer would carry on filling a segment nobody can
+   * reach.
    *
    * Args:
    *   name: Segment name, must start with a slash.
@@ -45,6 +47,16 @@ class ShmRegion {
    *   A mapped region that unlinks the segment on destruction.
    */
   static ShmRegion Create(const std::string& name, size_t bytes);
+
+  /*
+   * Reports whether a shared memory object exists.
+   *
+   * Args:
+   *   name: Segment name, must start with a slash.
+   * Returns:
+   *   True when a segment of that name is present.
+   */
+  static bool Exists(const std::string& name);
 
   /*
    * Attaches to a shared memory object that a producer already created.

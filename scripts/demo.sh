@@ -15,10 +15,10 @@ FPS="${FPS:-60}"
 PROFILE_A="${PROFILE_A:-espcn}"
 PROFILE_B="${PROFILE_B:-baseline}"
 
-SOCK_A=/tmp/framewire-demo-a.sock
-SOCK_B=/tmp/framewire-demo-b.sock
-SHM_A=/framewire-demo-a
-SHM_B=/framewire-demo-b
+SOCK_A=/tmp/framewire-demo-a-$$.sock
+SOCK_B=/tmp/framewire-demo-b-$$.sock
+SHM_A=/framewire-demo-a-$$
+SHM_B=/framewire-demo-b-$$
 
 for binary in framewire framewire-producer framewire-mock-mpv; do
   if [[ ! -x "$BUILD_DIR/$binary" ]]; then
@@ -34,6 +34,7 @@ cleanup() {
   done
   wait 2>/dev/null || true
   rm -f "$SOCK_A" "$SOCK_B"
+  rm -f "/dev/shm${SHM_A}" "/dev/shm${SHM_B}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 

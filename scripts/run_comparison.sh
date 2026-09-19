@@ -14,10 +14,10 @@ VIDEO="${1:-}"
 SHADER_A="${2:-}"
 SHADER_B="${3:-}"
 
-SOCK_A=/tmp/framewire-mpv-a.sock
-SOCK_B=/tmp/framewire-mpv-b.sock
-SHM_A=/framewire-a
-SHM_B=/framewire-b
+SOCK_A=/tmp/framewire-mpv-a-$$.sock
+SOCK_B=/tmp/framewire-mpv-b-$$.sock
+SHM_A=/framewire-a-$$
+SHM_B=/framewire-b-$$
 
 # mpv only fills in vo-passes for the gpu video outputs, so the choice is not
 # optional. gpu-next is preferred when the local mpv supports it
@@ -70,6 +70,7 @@ cleanup() {
   done
   wait 2>/dev/null || true
   rm -f "$SOCK_A" "$SOCK_B"
+  rm -f "/dev/shm${SHM_A}" "/dev/shm${SHM_B}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 

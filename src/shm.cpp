@@ -79,12 +79,16 @@ ShmRegion ShmRegion::Create(const std::string& name, size_t bytes) {
   CheckName(name);
   if (bytes == 0) throw std::runtime_error("refusing to create a zero byte shm segment");
 
-  // clear any leftover segment from a crashed run first. attaching to a stale
-  // segment of the wrong size is a much harder failure to debug than a restart
-  shm_unlink(name.c_str());
-
+  // O_EXCL on purpose. removing an existing segment here would pull the ring
+  // out from under a producer that is still writing to it, and that producer
+  // would keep reporting success while filling a segment nobody can reach
   const int fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR);
-  if (fd < 0) throw ShmError("shm_open", name);
+  if (fd < 0) {
+    if (errno == EEXIST) {
+      throw std::runtime_error("shm segment '" + name + "' already exists");
+    }
+    throw ShmError("shm_open", name);
+  }
 
   ShmRegion region;
   region.name_ = name;
@@ -144,6 +148,14 @@ ShmRegion ShmRegion::Open(const std::string& name) {
   // the attaching side never owns the segment lifetime, the creator does
   region.unlink_on_close_ = false;
   return region;
+}
+
+bool ShmRegion::Exists(const std::string& name) {
+  CheckName(name);
+  const int fd = shm_open(name.c_str(), O_RDONLY, 0);
+  if (fd < 0) return false;
+  close(fd);
+  return true;
 }
 
 bool ShmRegion::Remove(const std::string& name) {

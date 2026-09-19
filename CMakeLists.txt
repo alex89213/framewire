@@ -100,6 +100,17 @@ if(FRAMEWIRE_BUILD_TESTS)
     add_test(NAME ${suite} COMMAND test_${suite})
   endforeach()
 
+  # the only test that drives the whole chain, mock mpv through both producers
+  # and the aggregator to the report. runs headless, because a machine building
+  # this will not have a GPU, a display or a video file
+  find_program(BASH_PROGRAM bash)
+  if(BASH_PROGRAM)
+    add_test(NAME end_to_end
+             COMMAND ${BASH_PROGRAM} ${CMAKE_CURRENT_SOURCE_DIR}/tests/end_to_end.sh
+                     ${CMAKE_CURRENT_BINARY_DIR})
+    set_tests_properties(end_to_end PROPERTIES TIMEOUT 120)
+  endif()
+
   # a short stress run in the test suite, so the ring is exercised across real
   # processes on every build rather than only when run by hand
   add_test(NAME stress_smoke

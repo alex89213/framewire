@@ -49,6 +49,15 @@ constexpr uint64_t kHeartbeatIntervalNs = 250ull * 1000 * 1000;
 // restart rather than a small seek correction
 constexpr int64_t kLoopBackstepNs = 1000000000;
 
+// request ids for the one off environment queries, below the poll base so the
+// replies are told apart from per frame pass pulls
+constexpr int64_t kEnvIdBase = 100;
+
+// how often the window size is re-read. a window that moves to another output
+// or gets resized mid run changes the render target, which invalidates any
+// comparison made across the change
+constexpr uint64_t kGeometryCheckNs = 2ull * 1000 * 1000 * 1000;
+
 struct Options {
   std::string socket_path;
   std::string shm_name;
@@ -118,6 +127,80 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
     return false;
   }
   return true;
+}
+
+/*
+ * Reads one property synchronously, for the one off environment queries.
+ *
+ * Args:
+ *   client: Connected IPC client.
+ *   doc: Scratch document for parsing.
+ *   property: Property name to read.
+ * Returns:
+ *   The value as text, or an empty string when unavailable.
+ */
+std::string ReadPropertyText(MpvIpcClient& client, JsonDoc& doc, const std::string& property) {
+  static int64_t next_id = kEnvIdBase;
+  const int64_t want = next_id++;
+  if (!client.GetProperty(property, want)) return {};
+
+  std::string line;
+  const uint64_t deadline = MonotonicNanos() + 2ull * 1000 * 1000 * 1000;
+  while (MonotonicNanos() < deadline) {
+    if (client.PollLine(&line, 200) != MpvIpcClient::PollResult::Line) continue;
+    if (!doc.Parse(line)) continue;
+
+    const JsonValue root = doc.root();
+    if (root["request_id"].AsInt(-1) != want) continue;
+    if (root["error"].AsString() != "success") return {};
+
+    const JsonValue data = root["data"];
+    if (data.is_string()) return std::string(data.AsString());
+    if (data.is_number()) {
+      const int64_t n = data.AsInt(0);
+      return std::to_string(n);
+    }
+    if (data.is_bool()) return data.AsBool() ? "yes" : "no";
+    if (data.is_array() && data.size() > 0 && data[0].is_string()) {
+      return std::string(data[0].AsString());
+    }
+    return {};
+  }
+  return {};
+}
+
+/*
+ * Reads the size of the rectangle mpv is rendering into.
+ *
+ * Args:
+ *   client: Connected IPC client.
+ *   doc: Scratch document for parsing.
+ *   width: Receives the render width.
+ *   height: Receives the render height.
+ * Returns:
+ *   True when the size was read.
+ */
+bool ReadRenderSize(MpvIpcClient& client, JsonDoc& doc, int* width, int* height) {
+  static int64_t next_id = kEnvIdBase + 50;
+  const int64_t want = next_id++;
+  if (!client.GetProperty("osd-dimensions", want)) return false;
+
+  std::string line;
+  const uint64_t deadline = MonotonicNanos() + 2ull * 1000 * 1000 * 1000;
+  while (MonotonicNanos() < deadline) {
+    if (client.PollLine(&line, 200) != MpvIpcClient::PollResult::Line) continue;
+    if (!doc.Parse(line)) continue;
+
+    const JsonValue root = doc.root();
+    if (root["request_id"].AsInt(-1) != want) continue;
+
+    const JsonValue d = root["data"];
+    if (!d.is_object()) return false;
+    *width = static_cast<int>(d["w"].AsInt(0) - d["ml"].AsInt(0) - d["mr"].AsInt(0));
+    *height = static_cast<int>(d["h"].AsInt(0) - d["mt"].AsInt(0) - d["mb"].AsInt(0));
+    return *width > 0 && *height > 0;
+  }
+  return false;
 }
 
 /*
@@ -197,6 +280,30 @@ int Run(const Options& opt) {
   }
 
   JsonDoc doc;
+
+  // the environment is captured before any telemetry, so the consumer can tell
+  // whether two streams are even comparable. two runs on different renderers
+  // or at different window sizes are different experiments
+  int render_w = 0;
+  int render_h = 0;
+  ReadRenderSize(client, doc, &render_w, &render_h);
+  {
+    char env[kEnvironmentLen];
+    std::snprintf(env, sizeof(env),
+                  "mpv=%s\nvo=%s\ngpu_context=%s\nhwdec=%s\ndisplay=%s\n"
+                  "render=%dx%d\nvideo=%sx%s\n",
+                  ReadPropertyText(client, doc, "mpv-version").c_str(),
+                  ReadPropertyText(client, doc, "current-vo").c_str(),
+                  ReadPropertyText(client, doc, "current-gpu-context").c_str(),
+                  ReadPropertyText(client, doc, "hwdec-current").c_str(),
+                  ReadPropertyText(client, doc, "display-names").c_str(),
+                  render_w, render_h,
+                  ReadPropertyText(client, doc, "width").c_str(),
+                  ReadPropertyText(client, doc, "height").c_str());
+    producer.PublishEnvironment(env);
+    std::fprintf(stderr, "framewire-producer: render area %dx%d\n", render_w, render_h);
+  }
+
   std::vector<std::string> names;
   std::vector<const char*> name_ptrs;
   LayoutTracker layout;
@@ -218,6 +325,8 @@ int Run(const Options& opt) {
   int64_t media_epoch_ns = 0;
   uint64_t loops = 0;
   int overflow_warned = 0;
+  uint64_t last_geometry_check = MonotonicNanos();
+  uint64_t geometry_changes = 0;
 
   std::string line;
   while (!Terminal::ShutdownRequested()) {
@@ -225,6 +334,22 @@ int Run(const Options& opt) {
     if (now - last_heartbeat > kHeartbeatIntervalNs) {
       producer.Heartbeat();
       last_heartbeat = now;
+    }
+
+    if (render_w > 0 && now - last_geometry_check > kGeometryCheckNs) {
+      last_geometry_check = now;
+      int w = 0;
+      int h = 0;
+      if (ReadRenderSize(client, doc, &w, &h) && (w != render_w || h != render_h)) {
+        std::fprintf(stderr,
+                     "framewire-producer: render area changed from %dx%d to %dx%d, "
+                     "measurements before and after are not comparable\n",
+                     render_w, render_h, w, h);
+        render_w = w;
+        render_h = h;
+        ++geometry_changes;
+        producer.NoteGeometryChange();
+      }
     }
 
     const auto result = client.PollLine(&line, 200);
@@ -366,6 +491,10 @@ int Run(const Options& opt) {
                static_cast<unsigned long long>(producer.dropped()),
                static_cast<unsigned long long>(parse_errors),
                static_cast<unsigned long long>(poll_errors));
+  if (geometry_changes > 0) {
+    std::fprintf(stderr, "framewire-producer: window changed size %llu times during the run\n",
+                 static_cast<unsigned long long>(geometry_changes));
+  }
   if (loops > 0) {
     std::fprintf(stderr, "framewire-producer: video looped %llu times\n",
                  static_cast<unsigned long long>(loops));

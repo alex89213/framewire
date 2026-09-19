@@ -22,6 +22,43 @@ namespace {
 
 bool IsPowerOfTwo(uint32_t v) { return v != 0 && (v & (v - 1)) == 0; }
 
+// a producer that checked in this recently is treated as still running
+constexpr uint64_t kLiveProducerNs = 3ull * 1000 * 1000 * 1000;
+
+/*
+ * Decides what to do about a segment that already exists.
+ *
+ * A leftover from a crashed run should be replaced. A segment a live producer
+ * is still writing to must not be, because removing it would leave that
+ * producer filling memory no consumer can reach while it reports success.
+ *
+ * Args:
+ *   name: Segment name.
+ * Returns:
+ *   An empty string when the segment is safe to replace, otherwise a
+ *   description of who is using it.
+ */
+std::string DescribeLiveOwner(const std::string& name) {
+  try {
+    ShmRegion probe = ShmRegion::Open(name);
+    if (probe.size() < sizeof(RingHeader)) return {};
+
+    const auto* header = static_cast<const RingHeader*>(probe.data());
+    if (header->magic != kRingMagic) return {};
+    if (header->producer_done.load(std::memory_order_acquire) != 0) return {};
+
+    const uint64_t beat = header->producer_heartbeat_ns.load(std::memory_order_relaxed);
+    const uint64_t now = MonotonicNanos();
+    if (now > beat && (now - beat) > kLiveProducerNs) return {};
+
+    const uint32_t pid = header->producer_pid.load(std::memory_order_relaxed);
+    return "a producer with pid " + std::to_string(pid) + " is still streaming to it";
+  } catch (const std::exception&) {
+    // unreadable or half built, so replacing it is the right move
+    return {};
+  }
+}
+
 }  // namespace
 
 RingMapping RingMapping::Create(const std::string& name, uint32_t capacity,
@@ -29,6 +66,18 @@ RingMapping RingMapping::Create(const std::string& name, uint32_t capacity,
   if (!IsPowerOfTwo(capacity)) {
     throw std::runtime_error("ring capacity must be a power of two, got " +
                              std::to_string(capacity));
+  }
+
+  if (ShmRegion::Exists(name)) {
+    const std::string owner = DescribeLiveOwner(name);
+    if (!owner.empty()) {
+      throw std::runtime_error(
+          "ring '" + name + "' is already in use, " + owner +
+          ". pick a different --shm name, or stop the other run. reusing the name would "
+          "leave one producer writing where nothing reads");
+    }
+    // stale leftover from a run that did not shut down cleanly
+    ShmRegion::Remove(name);
   }
 
   RingMapping m;
@@ -52,6 +101,9 @@ RingMapping RingMapping::Create(const std::string& name, uint32_t capacity,
   m.header_->layout_version.store(0, std::memory_order_relaxed);
   m.header_->pass_count.store(0, std::memory_order_relaxed);
   m.header_->producer_heartbeat_ns.store(m.header_->created_mono_ns, std::memory_order_relaxed);
+  m.header_->environment_version.store(0, std::memory_order_relaxed);
+  m.header_->geometry_changes.store(0, std::memory_order_relaxed);
+  m.header_->environment[0] = '\0';
 
   m.slots_ = reinterpret_cast<TelemetryRecord*>(static_cast<char*>(m.region_.data()) +
                                                 sizeof(RingHeader));
@@ -157,6 +209,17 @@ uint8_t RingProducer::PublishLayout(const char* const* names, unsigned count) {
   return static_cast<uint8_t>(next & 0xFF);
 }
 
+void RingProducer::PublishEnvironment(const std::string& text) {
+  std::snprintf(header_->environment, kEnvironmentLen, "%s", text.c_str());
+  // release publishes the text above, so a consumer that sees a non zero
+  // version never reads a half written block
+  header_->environment_version.store(1, std::memory_order_release);
+}
+
+void RingProducer::NoteGeometryChange() {
+  header_->geometry_changes.fetch_add(1, std::memory_order_relaxed);
+}
+
 void RingProducer::Heartbeat() {
   header_->producer_heartbeat_ns.store(MonotonicNanos(), std::memory_order_relaxed);
 }
@@ -240,6 +303,16 @@ unsigned RingConsumer::ReadLayout(char out_names[kMaxPasses][kPassNameLen],
 
   if (out_version != nullptr) *out_version = version;
   return count;
+}
+
+std::string RingConsumer::ReadEnvironment() const {
+  // acquire pairs with the producer's release in PublishEnvironment
+  if (header_->environment_version.load(std::memory_order_acquire) == 0) return {};
+
+  char buffer[kEnvironmentLen];
+  std::memcpy(buffer, header_->environment, kEnvironmentLen);
+  buffer[kEnvironmentLen - 1] = '\0';
+  return std::string(buffer);
 }
 
 uint64_t RingConsumer::PendingCount() const {

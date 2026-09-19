@@ -190,8 +190,14 @@ SSIM, because it sharpens in a way PSNR rewards and SSIM does not. Report both.
 ### Without a GPU
 
 A mock mpv server ships with the project and speaks enough of the IPC protocol
-to drive the whole pipeline. The mock is how the dashboard and the correlator
-get tested, and the mock is useful for seeing the view without a video file.
+to drive the whole pipeline headless, with no GPU, no display and no video
+file. That is what the `end_to_end` test uses, since a machine building this
+project will not have any of those.
+
+The mock is strict about argument types, because an earlier permissive version
+answered every command with success and hid a bug that left the real tool
+capturing nothing. A mock is never allowed to be the only thing exercising a
+protocol path.
 
 ```sh
 scripts/demo.sh 30
@@ -583,6 +589,7 @@ Four unit suites and a stress test, all wired into CTest:
 | `json` | scalars, escapes and surrogate pairs, containers, 22 malformed inputs, depth limits, real mpv message shapes, writer round trip |
 | `histogram` | quantile accuracy against an exact sorted reference, the bucket zero linear range, clamping past the ceiling, merging, both sliding windows |
 | `stats` | frame pairing, unmatched retirement, flushing, per pass gating, corrupt record handling, sequence gap counting, duration formatting |
+| `end_to_end` | mock mpv through both producers, the rings, the aggregator and the report, checked for lossless capture and a correct verdict |
 | `stress_smoke` | a short two process run of the full stress harness |
 
 The stress harness is the real test of the ring. Run a longer one directly:

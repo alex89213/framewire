@@ -291,6 +291,34 @@ std::string BuildTextReport(const StreamSnapshot& a, const StreamSnapshot& b,
   stream_block(a, "a");
   stream_block(b, "b");
 
+  auto env_block = [&](const StreamSnapshot& s, const char* tag) {
+    if (s.environment.empty()) return;
+    line(Format("[%s] capture environment", tag));
+    for (const auto& kv : ParseEnvironment(s.environment)) {
+      if (kv.second.empty()) continue;
+      line(Format("  %-16s %s", kv.first.c_str(), kv.second.c_str()));
+    }
+    if (s.geometry_changes > 0) {
+      line(Format("  %-16s %u times during the run", "window resized", s.geometry_changes));
+    }
+    line("");
+  };
+  env_block(a, "a");
+  env_block(b, "b");
+
+  const auto mismatches = EnvironmentMismatches(a.environment, b.environment);
+  if (!mismatches.empty()) {
+    line("[warning] the two streams were not captured under the same conditions,");
+    line("          so the comparison below is not a like for like measurement:");
+    for (const auto& m : mismatches) line("  " + m);
+    line("");
+  }
+  if (a.geometry_changes > 0 || b.geometry_changes > 0) {
+    line("[warning] a window changed size mid run, so timings before and after the");
+    line("          change describe different render targets");
+    line("");
+  }
+
   // two players rendering the same file should present at the same rate. a
   // large split means one window is not rendering normally, which on a
   // compositor that throttles hidden surfaces produces timings that look fast
@@ -346,6 +374,19 @@ std::string BuildJsonReport(const StreamSnapshot& a, const StreamSnapshot& b,
     o += Format(",\"ring_lost\":%llu", static_cast<unsigned long long>(s.producer_drops));
     o += Format(",\"checksum_errors\":%llu", static_cast<unsigned long long>(s.checksum_errors));
     o += Format(",\"sequence_gaps\":%llu", static_cast<unsigned long long>(s.sequence_gaps));
+    o += Format(",\"geometry_changes\":%u", s.geometry_changes);
+
+    o += ",\"environment\":{";
+    bool first_env = true;
+    for (const auto& kv : ParseEnvironment(s.environment)) {
+      if (kv.second.empty()) continue;
+      if (!first_env) o.push_back(',');
+      first_env = false;
+      JsonEscapeTo(o, kv.first);
+      o.push_back(':');
+      JsonEscapeTo(o, kv.second);
+    }
+    o.push_back('}');
 
     o += ",\"passes\":[";
     for (size_t i = 0; i < s.passes.size(); ++i) {
@@ -373,7 +414,17 @@ std::string BuildJsonReport(const StreamSnapshot& a, const StreamSnapshot& b,
   out += Format(",\"gpu_delta_p99_ns\":%lld", static_cast<long long>(cmp.gpu_delta_p99));
   out += Format(",\"a_faster_fraction\":%.6f", cmp.a_faster_fraction);
   out += Format(",\"speedup_a_over_b\":%.6f", cmp.speedup);
-  out += "}}\n";
+  out += "}";
+
+  // a consumer of this file should be able to see that the two sides were not
+  // comparable without having to work it out from the environment blocks
+  out += ",\"environment_mismatches\":[";
+  const auto mismatches = EnvironmentMismatches(a.environment, b.environment);
+  for (size_t i = 0; i < mismatches.size(); ++i) {
+    if (i != 0) out.push_back(',');
+    JsonEscapeTo(out, mismatches[i]);
+  }
+  out += "]}\n";
   return out;
 }
 

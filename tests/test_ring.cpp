@@ -245,6 +245,66 @@ void TestProducerLiveness() {
   }
 }
 
+void TestEnvironmentBlock() {
+  TEST_CASE("environment publishes and reads back") {
+    const std::string name = SegmentName("env");
+    RingProducer producer(RingMapping::Create(name, 8, "env"));
+    RingConsumer consumer(RingMapping::Open(name));
+
+    // nothing published yet, so the consumer must not invent a value
+    CHECK(consumer.ReadEnvironment().empty());
+
+    producer.PublishEnvironment("vo=gpu-next\nrender=1274x716\n");
+    const std::string text = consumer.ReadEnvironment();
+    CHECK(text.find("vo=gpu-next") != std::string::npos);
+    CHECK(text.find("render=1274x716") != std::string::npos);
+
+    CHECK_EQ(consumer.geometry_changes(), 0);
+    producer.NoteGeometryChange();
+    producer.NoteGeometryChange();
+    CHECK_EQ(consumer.geometry_changes(), 2);
+  }
+
+  TEST_CASE("an oversized environment is truncated, not overrun") {
+    const std::string name = SegmentName("envbig");
+    RingProducer producer(RingMapping::Create(name, 8, "envbig"));
+    RingConsumer consumer(RingMapping::Open(name));
+
+    producer.PublishEnvironment(std::string(4000, 'x'));
+    CHECK_EQ(consumer.ReadEnvironment().size(), kEnvironmentLen - 1);
+  }
+}
+
+void TestNameCollision() {
+  TEST_CASE("a live producer keeps its ring name") {
+    const std::string name = SegmentName("busy");
+    RingProducer first(RingMapping::Create(name, 8, "first"));
+    first.Heartbeat();
+
+    // taking the name would leave the first producer writing where nothing
+    // reads, while both sides reported success
+    bool threw = false;
+    try {
+      RingMapping::Create(name, 8, "second");
+    } catch (const std::exception& e) {
+      threw = true;
+      CHECK(std::string(e.what()).find("already in use") != std::string::npos);
+    }
+    CHECK(threw);
+  }
+
+  TEST_CASE("a finished producer releases its ring name") {
+    const std::string name = SegmentName("released");
+    {
+      RingProducer first(RingMapping::Create(name, 8, "first"));
+      first.MarkDone();
+      // a producer that said it was done is not an obstacle
+      RingMapping second = RingMapping::Create(name, 8, "second");
+      CHECK(second.header()->magic == kRingMagic);
+    }
+  }
+}
+
 void TestRejectsBadSegment() {
   TEST_CASE("opening rejects a segment that is not a ring") {
     const std::string name = SegmentName("bogus");
@@ -325,6 +385,8 @@ int main() {
   TestBatchPopAcrossWrap();
   TestLayoutDirectory();
   TestProducerLiveness();
+  TestEnvironmentBlock();
+  TestNameCollision();
   TestRejectsBadSegment();
   TestThreadedHandoff();
   return fwtest::Finish("test_ring");

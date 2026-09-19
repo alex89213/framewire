@@ -25,7 +25,12 @@ namespace framewire {
 inline constexpr size_t kCacheLine = 64;
 
 inline constexpr uint32_t kRingMagic = 0x4657524Bu;  // "FWRK"
-inline constexpr uint32_t kRingAbiVersion = 1;
+inline constexpr uint32_t kRingAbiVersion = 2;
+
+// room for the key=value description of the environment a stream was captured
+// in. two streams recorded under different renderers or at different window
+// sizes are not comparable, and the only way to know is to record it
+inline constexpr unsigned kEnvironmentLen = 512;
 
 /*
  * Control block at the front of the shared memory segment.
@@ -67,9 +72,14 @@ struct alignas(kCacheLine) RingHeader {
   std::atomic<uint32_t> pass_count;
   std::atomic<uint32_t> producer_pid;
   std::atomic<uint32_t> producer_done;
+  std::atomic<uint32_t> environment_version;  // non zero once environment is written
+  std::atomic<uint32_t> geometry_changes;     // window resized mid run this many times
 
   // --- pass name directory, producer writes then publishes layout_version ---
   alignas(kCacheLine) char pass_names[kMaxPasses][kPassNameLen];
+
+  // --- capture environment, written once before streaming starts ---
+  alignas(kCacheLine) char environment[kEnvironmentLen];
 };
 
 static_assert(sizeof(RingHeader) % kCacheLine == 0, "header must end on a cache line");
@@ -179,6 +189,21 @@ class RingProducer {
    */
   uint8_t PublishLayout(const char* const* names, unsigned count);
 
+  /*
+   * Publishes the environment this stream was captured in.
+   *
+   * Written once before streaming, as key=value lines. The consumer compares
+   * the two streams and refuses to treat them as one experiment when the
+   * renderer, the decode path or the window size differ.
+   *
+   * Args:
+   *   text: Newline separated key=value lines.
+   */
+  void PublishEnvironment(const std::string& text);
+
+  // Counts a window resize, which invalidates comparisons made across it.
+  void NoteGeometryChange();
+
   // Records a liveness stamp so the consumer can flag a stalled producer.
   void Heartbeat();
 
@@ -248,6 +273,19 @@ class RingConsumer {
    *   Number of names copied.
    */
   unsigned ReadLayout(char out_names[kMaxPasses][kPassNameLen], uint32_t* out_version) const;
+
+  /*
+   * Reads the environment the producer recorded.
+   *
+   * Returns:
+   *   The key=value block, or an empty string when the producer wrote none.
+   */
+  std::string ReadEnvironment() const;
+
+  // How many times the window changed size while the stream was running.
+  uint32_t geometry_changes() const {
+    return header_->geometry_changes.load(std::memory_order_relaxed);
+  }
 
   // Number of records sitting in the ring right now.
   uint64_t PendingCount() const;
