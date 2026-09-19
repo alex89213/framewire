@@ -1,9 +1,9 @@
 /*
- * Description: Consumer process. Reads both telemetry rings, correlates frames
- *   between the two mpv instances and draws the live comparison dashboard.
+ * Description: Consumer process. Reads every telemetry ring, groups frames
+ *   across the mpv instances and draws the live comparison dashboard.
  * Author: Alex Wu
  * Dependencies: framewire core library
- * Usage: framewire --shm-a /framewire-a --shm-b /framewire-b
+ * Usage: framewire --shm /framewire-a --shm /framewire-b [--shm ...]
  */
 
 #include <cstdio>

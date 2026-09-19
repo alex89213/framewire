@@ -89,13 +89,14 @@ records its environment into the ring header before any telemetry flows:
   vo               gpu-next
 ```
 
-The consumer compares the two and refuses to present the result as like for
-like when the renderer, the decode path or the render size differ:
+The consumer compares every stream against the baseline and refuses to present
+the result as like for like when the renderer, the decode path or the render
+size differ:
 
 ```
-[warning] the two streams were not captured under the same conditions,
+[warning] streams were not captured under the same conditions,
           so the comparison below is not a like for like measurement:
-  vo: a has 'gpu-next', b has 'gpu'
+  lanczos vs espcn, vo: a has 'gpu-next', b has 'gpu'
 ```
 
 Only keys that change what a number means are treated as blocking. A different
@@ -108,9 +109,31 @@ window that moves to another output or gets resized changes the render target,
 so timings either side of the change describe different work, and the report
 says so rather than averaging across it.
 
-The report also warns when the two players present at rates more than ten
-percent apart, which is the visible symptom of a window a compositor has
-throttled because it is hidden or off screen. Discard runs that warn.
+The report also warns when the players present at rates more than ten percent
+apart, which is the visible symptom of a window a compositor has throttled
+because it is hidden or off screen. Discard runs that warn.
+
+## Shaders that are not 2x
+
+The sizing above assumes a shader that doubles. `--scale` on the quality pass,
+or `SCALE` on `compare.sh`, sets the factor the shader actually supplies, and
+the input clip becomes the render area divided by it.
+
+A factor that does not divide the render area evenly leaves a small residual
+resample, so the quality pass reports which case a run is in rather than
+folding it silently into the score:
+
+```
+  2x shader output lands on the render target exactly, nothing is resampled
+```
+
+or
+
+```
+  warning: a 4x shader on a 318x179 clip lands at 1272x716, not 1274x716.
+  the output is resampled by 1.002x1.000 before capture, which compresses the
+  differences between configs
+```
 
 ## Ring names
 
@@ -140,6 +163,6 @@ paired run reported, which is close enough to trust the comparison.
 One run produced an implausible result, a 30 pass network reporting less GPU
 time than a 9 pass one, and it did not reproduce. The likely cause is a window
 that was not rendering normally, since a compositor can throttle a surface that
-is hidden or off screen. The report now prints a warning when the two players
-present at rates more than 10 percent apart, because that split is the visible
-symptom of the problem. Keep both windows fully visible when measuring.
+is hidden or off screen. The report now prints a warning when players present
+at rates more than 10 percent apart, because that split is the visible symptom
+of the problem. Keep both windows fully visible when measuring.

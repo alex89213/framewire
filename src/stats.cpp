@@ -1,6 +1,6 @@
 /*
- * Description: Implementation of per stream aggregation and the timestamp
- *   correlator that pairs frames across the two mpv instances.
+ * Description: Implementation of per stream aggregation, the k way correlator
+ *   that groups frames across the mpv instances, and the interval estimates.
  * Author: Alex Wu
  * Dependencies: framewire/stats.h
  * Usage:

@@ -1,6 +1,6 @@
 /*
- * Description: Per stream telemetry aggregation and the correlator that pairs
- *   frames from the two mpv instances by monotonic timestamp.
+ * Description: Per stream telemetry aggregation and the correlator that groups
+ *   frames across any number of mpv instances by media position.
  * Author: Alex Wu
  * Dependencies: framewire/histogram.h, framewire/spsc_ring.h
  * Usage:

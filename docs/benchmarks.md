@@ -84,7 +84,7 @@ small enough not to matter.
 
 Measured with `scripts/run_comparison.sh` against real mpv on real hardware, not
 the mock. Source is a 960x540 h264 clip, each shader is a 2x luma upscaler, and
-each run pairs two mpv instances side by side for 20 seconds with
+each run puts two mpv instances side by side for 20 seconds with
 `--vo=gpu-next`. Numbers are total GPU time per frame across every pass.
 
 | A | B | A p50 | B p50 | delta p50 | A cheaper on |

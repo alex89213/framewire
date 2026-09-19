@@ -80,7 +80,7 @@ histogram cannot forget old samples, and the dashboard needs to show what the
 last few seconds look like. Sorting a few thousand values ten times a second
 costs nothing and is exact.
 
-## Correlating the two streams
+## Grouping frames across the streams
 
 Frames are matched on media position, not arrival time. This was the single
 biggest correctness fix that real usage forced.
@@ -135,9 +135,9 @@ where a shader comparison lands when one side wins almost every frame.
 An interval that straddles zero means the run did not separate the two, and the
 report says so instead of quoting the point estimate and staying quiet.
 
-Every comparative number comes from paired frames only. Comparing the two
-independent averages would be misleading, because the two instances can render
-a different number of frames over the same wall time.
+Every comparative number comes from grouped frames only. Comparing independent
+averages would be misleading, because the instances can render a different
+number of frames over the same wall time.
 
 Per pass differences are only reported when both chains have the same pass
 count. Lining up pass three of a five pass chain against pass three of a three

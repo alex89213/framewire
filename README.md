@@ -6,8 +6,8 @@ instead of impressions.
 framewire runs two `mpv` instances side by side on the same clip with different
 shaders, captures per frame GPU render timings from each over mpv's JSON IPC
 socket, moves them through a lock free shared memory ring per instance, and
-aggregates both streams in a separate process that pairs frames and draws a
-live terminal dashboard. An optional second pass scores upscaling quality, so
+aggregates every stream in a separate process that groups frames across all of
+them and draws a live terminal dashboard. An optional second pass scores upscaling quality, so
 cost and quality land in one table.
 
 It was built to answer one question about a custom GLSL ESPCN upscaler: does it
@@ -192,41 +192,40 @@ Each binary runs on its own, which is handy when attaching to an mpv instance
 that is already playing.
 
 ```sh
-# one producer per player
+# one producer per player, any number of them
 build/framewire-producer --socket /tmp/mpv-a.sock --shm /framewire-a --label espcn
 build/framewire-producer --socket /tmp/mpv-b.sock --shm /framewire-b --label baseline
 
 # the dashboard
-build/framewire --shm-a /framewire-a --shm-b /framewire-b
+build/framewire --shm /framewire-a --shm /framewire-b
 ```
 
 ## Reading the output
 
 ```
- framewire  live  00:00:06  paired 174
+ framewire  live  00:00:15  2 streams  grouped 367
 
 espcn_x2_8 live                                             ewa_lanczossharp live
 ──────────────────────────────────────────────────────────  ──────────────────────────────────────────────────────────
-gpu    now 1.25ms   p50 749.7us  p99 1.34ms   p999 1.77ms   gpu    now 1.44ms   p50 873.2us  p99 3.92ms   p999 3.92ms
-frame  now 45.28ms  p50 41.81ms  p99 83.90ms  p999 84.13ms  frame  now 41.75ms  p50 41.82ms  p99 86.53ms  p999 125.95m
-life   p50 750.6us  p99 1.34ms   max  1.77ms                life   p50 873.5us  p99 3.92ms   max  3.92ms
-fps    23.7 now  23.7 avg   frames 177                      fps    23.9 now  23.9 avg   frames 179
+gpu    now 1.47ms   p50 1.21ms   p99 2.15ms   p999 2.31ms   gpu    now 4.26ms   p50 1.65ms   p99 5.67ms   p999 7.78ms
+frame  now 41.06ms  p50 41.80ms  p99 83.54ms  p999 84.79ms  frame  now 45.97ms  p50 41.78ms  p99 83.82ms  p999 85.86ms
+life   p50 1.21ms   p99 2.15ms   max  2.31ms                life   p50 1.65ms   p99 5.68ms   max  7.78ms
+fps    24.0 now  24.0 avg   frames 369                      fps    24.0 now  24.0 avg   frames 370
 dropped 0 (0.00%)  delayed 0                                dropped 0 (0.00%)  delayed 0
 ring   pend 0     lost 0     crc 0 gaps 0                   ring   pend 0     lost 0     crc 0 gaps 0
-▁▁▁▁▁▁▂▂▂▁▁▂▂▂▁▁▂▁▁▁█▂▂▂▂▂▂▂▂▂▂▄▂▂▃▃▂▂▂▃▂▂▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃  ▅▁██▁▁▇▁▁▁▄▁▁▆▄▁▁▁▁▁▁▃██▁▁▁▁▁▁▇▇▁▅▄▁▂▁▂▂▂▁▅▂▂▂▂▆█▂▂▂▂▂▇▂▇▂
+▂▂▂▂▃▂▂▂▃▂▂▅▇▂▂▁▁▁▃▁▃▁▁▁▃▃▁▁▂▂▂▁▃▁▁▃▇▂▄▁▁▁▁▁▁▁▃▁▂▂▁▁▂▁█▁▁▁  ▁▇▁▁▁▁▁▁▁▁▁▆▁▁▁▁▁▁▇▁▁█▁▁▁▁▁▆▇▁▁▁▁▁▁▁▁▁▁▁▁▆▆▁▁▁▁▁▁▁▁▁▁▁▁▁▁█
 
 passes                                                      passes
- espcn_x2_8 conv1 (5x5, 1->8) 107.6us  186.3us               color decoding               49.9us   116.4us
- espcn_x2_8 conv1 (5x5, 1->8) 104.8us  175.7us               polar upscaling (ewa_lanczos 823.6us  3.86ms
- espcn_x2_8 conv2 (3x3, 8->8) 82.1us   137.4us
- espcn_x2_8 conv2 (3x3, 8->8) 79.1us   131.6us
- espcn_x2_8 conv3 + pixel shu 303.9us  507.6us
- color decoding, color encodi 72.1us   262.2us
+ espcn_x2_8 conv1 (5x5, 1->8) 172.7us  655.1us               color decoding               87.2us   207.5us
+ espcn_x2_8 conv1 (5x5, 1->8) 165.0us  223.1us               polar upscaling (ewa_lanczos 1.54ms   5.59ms
+ espcn_x2_8 conv2 (3x3, 8->8) 130.2us  320.9us
+ espcn_x2_8 conv2 (3x3, 8->8) 124.6us  178.4us
+ espcn_x2_8 conv3 + pixel shu 481.3us  708.9us
+ color decoding, color encodi 121.6us  672.5us
 
- comparison  b minus a  ─────────────────────────────────────────────────────────────────────────────────────────────
- gpu delta   p50 +97.8us    p99 +2.81ms    mean +324.3us
- faster      espcn_x2_8 on 97.1% of paired frames   speedup 0.859x
- unmatched   a 3   b 3
+ comparison against espcn_x2_8  ─────────────────────────────────────────────────────────────────────────────────────
+ ewa_lanczossharp     +168.4us   [+136.2us, +217.0us]     5.7%  0.733x
+ unmatched  espcn_x2_8 2   ewa_lanczossharp 1
 ```
 
 Row by row:
@@ -251,8 +250,10 @@ Row by row:
   `lost`, `crc` and `gaps` are all zero, and the row turns red when a value is
   not.
 - The sparkline shows recent total GPU time, scaled to the visible range.
-- **comparison** is computed only from frames that were paired across both
-  streams, so the two sides are always compared on equal footing.
+- **comparison** is computed only from frames matched across every stream, so
+  the configurations are always compared on the same frames. Each row is a
+  difference against the baseline with a 95% interval, and a difference whose
+  interval crosses zero is greyed out and marked as inside the noise.
 
 Keys: `q` quits, `p` pauses accumulation, `r` resets every statistic.
 
