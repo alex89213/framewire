@@ -37,6 +37,10 @@ environment:
   LABEL_A         dashboard label for the left panel
   LABEL_B         dashboard label for the right panel
   DURATION        stop after this many seconds
+  MPV_EXTRA_A     extra mpv flags for the left panel, for example --scale=bilinear
+  MPV_EXTRA_B     extra mpv flags for the right panel
+  GEOMETRY_A      mpv --geometry for the left panel, for example 940x530+10+40
+  GEOMETRY_B      mpv --geometry for the right panel
 USAGE
   exit 2
 fi
@@ -53,8 +57,8 @@ for binary in framewire framewire-producer; do
   fi
 done
 
-LABEL_A="${LABEL_A:-$([[ -n "$SHADER_A" ]] && basename "$SHADER_A" .glsl || echo baseline-a)}"
-LABEL_B="${LABEL_B:-$([[ -n "$SHADER_B" ]] && basename "$SHADER_B" .glsl || echo baseline-b)}"
+LABEL_A="${LABEL_A:-$([[ -n "$SHADER_A" ]] && basename "$SHADER_A" .glsl || echo builtin-a)}"
+LABEL_B="${LABEL_B:-$([[ -n "$SHADER_B" ]] && basename "$SHADER_B" .glsl || echo builtin-b)}"
 
 PIDS=()
 
@@ -70,7 +74,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 start_mpv() {
-  local socket="$1" shader="$2" label="$3"
+  local socket="$1" shader="$2" label="$3" extra="$4" geometry="$5"
   local args=(
     --input-ipc-server="$socket"
     --vo="$VO"
@@ -83,13 +87,21 @@ start_mpv() {
   if [[ -n "$shader" ]]; then
     args+=(--glsl-shaders="$shader")
   fi
+  if [[ -n "$geometry" ]]; then
+    args+=(--geometry="$geometry")
+  fi
+  # unquoted on purpose, the variable carries several separate mpv flags
+  if [[ -n "$extra" ]]; then
+    # shellcheck disable=SC2206
+    args+=($extra)
+  fi
   mpv "${args[@]}" "$VIDEO" &
   PIDS+=($!)
 }
 
 echo "framewire: starting mpv instances with vo=$VO"
-start_mpv "$SOCK_A" "$SHADER_A" "$LABEL_A"
-start_mpv "$SOCK_B" "$SHADER_B" "$LABEL_B"
+start_mpv "$SOCK_A" "$SHADER_A" "$LABEL_A" "${MPV_EXTRA_A:-}" "${GEOMETRY_A:-}"
+start_mpv "$SOCK_B" "$SHADER_B" "$LABEL_B" "${MPV_EXTRA_B:-}" "${GEOMETRY_B:-}"
 
 # the producers retry the connect themselves, so no sleep is needed here beyond
 # giving mpv a moment to get past its own startup

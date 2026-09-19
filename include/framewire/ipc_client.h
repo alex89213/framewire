@@ -76,6 +76,20 @@ class MpvIpcClient {
   bool ObserveProperty(int64_t observe_id, const std::string& property);
 
   /*
+   * Asks mpv for the current value of a property.
+   *
+   * Needed because mpv accepts an observe request for vo-passes but then only
+   * ever sends the value once. Per frame pass timings have to be pulled.
+   *
+   * Args:
+   *   property: Property name to read.
+   *   request_id: Value mpv echoes back, used to match the reply.
+   * Returns:
+   *   True when the request was sent.
+   */
+  bool GetProperty(const std::string& property, int64_t request_id);
+
+  /*
    * Waits for the next complete message.
    *
    * Args:
@@ -93,6 +107,9 @@ class MpvIpcClient {
  private:
   // Pulls one already buffered line out of the read buffer.
   bool TakeBufferedLine(std::string* out_line);
+
+  // Writes one complete newline terminated line to the socket.
+  bool SendRaw(const std::string& line);
 
   int fd_ = -1;
   std::string read_buffer_;

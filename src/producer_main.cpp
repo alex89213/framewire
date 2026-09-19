@@ -23,12 +23,31 @@ namespace {
 
 using namespace framewire;
 
-// observe ids, echoed back by mpv on every property change event
-constexpr int64_t kObserveVoPasses = 1;
+// observe ids, echoed back by mpv on every property change event.
+//
+// vo-passes is deliberately not in this list. mpv accepts an observe request
+// for the property and then only ever sends the value once, so per frame pass
+// timings have to be pulled with get_property instead. playback-time is the
+// clock that drives those pulls, because the property ticks exactly once per
+// decoded frame
+constexpr int64_t kObserveFrameTick = 1;
 constexpr int64_t kObserveDropCount = 2;
 constexpr int64_t kObserveDelayedCount = 3;
 
+// request ids for the vo-passes pulls start above the observe ids so a reply
+// can be told apart from an observe acknowledgement by id alone
+constexpr int64_t kPollIdBase = 1000;
+
+// cap on vo-passes requests in flight. mpv answers in order, and letting the
+// queue grow without limit would turn a slow reply into unbounded memory and
+// telemetry that lags further behind every frame
+constexpr int kMaxOutstandingPolls = 4;
+
 constexpr uint64_t kHeartbeatIntervalNs = 250ull * 1000 * 1000;
+
+// a playback position that jumps back by more than this counts as a loop
+// restart rather than a small seek correction
+constexpr int64_t kLoopBackstepNs = 1000000000;
 
 struct Options {
   std::string socket_path;
@@ -130,21 +149,30 @@ unsigned ReadPasses(const JsonValue& passes, TelemetryRecord* rec,
   unsigned count = 0;
   uint64_t total = 0;
 
-  for (JsonValue p = passes.FirstChild(); p.valid() && count < kMaxPasses; p = p.NextSibling()) {
+  unsigned seen = 0;
+  for (JsonValue p = passes.FirstChild(); p.valid(); p = p.NextSibling()) {
     // mpv reports pass times in nanoseconds already, so no unit conversion
     const int64_t last = p["last"].AsInt(0);
     const uint64_t value = last > 0 ? static_cast<uint64_t>(last) : 0;
 
-    rec->pass_ns[count] = static_cast<uint32_t>(value > UINT32_MAX ? UINT32_MAX : value);
+    // the total keeps accumulating past the storage cap on purpose. a chain
+    // longer than pass_ns can hold still has to report an honest gpu total,
+    // otherwise the longer chain looks cheaper than it really is
     total += value;
-    names->emplace_back(p["desc"].AsString(""));
-    ++count;
+    ++seen;
+
+    if (count < kMaxPasses) {
+      rec->pass_ns[count] = static_cast<uint32_t>(value > UINT32_MAX ? UINT32_MAX : value);
+      names->emplace_back(p["desc"].AsString(""));
+      ++count;
+    }
   }
 
   for (unsigned i = count; i < kMaxPasses; ++i) rec->pass_ns[i] = 0;
   rec->pass_count = static_cast<uint8_t>(count);
   rec->gpu_total_ns = total;
-  return count;
+  if (seen > count) rec->flags |= kFlagPassOverflow;
+  return seen;
 }
 
 int Run(const Options& opt) {
@@ -161,7 +189,7 @@ int Run(const Options& opt) {
   std::fprintf(stderr, "framewire-producer: ring %s ready, %u slots\n", opt.shm_name.c_str(),
                opt.capacity);
 
-  if (!client.ObserveProperty(kObserveVoPasses, "vo-passes") ||
+  if (!client.ObserveProperty(kObserveFrameTick, "playback-time") ||
       !client.ObserveProperty(kObserveDropCount, "frame-drop-count") ||
       !client.ObserveProperty(kObserveDelayedCount, "vo-delayed-frame-count")) {
     std::fprintf(stderr, "framewire-producer: %s\n", client.last_error().c_str());
@@ -181,6 +209,15 @@ int Run(const Options& opt) {
   uint32_t last_drop_total = 0;
   uint32_t last_delayed_total = 0;
   uint64_t parse_errors = 0;
+  uint64_t poll_errors = 0;
+  uint64_t frame_ticks = 0;
+  int64_t next_poll_id = 0;
+  int outstanding_polls = 0;
+  int64_t media_time_ns = 0;
+  int64_t last_position_ns = 0;
+  int64_t media_epoch_ns = 0;
+  uint64_t loops = 0;
+  int overflow_warned = 0;
 
   std::string line;
   while (!Terminal::ShutdownRequested()) {
@@ -210,19 +247,59 @@ int Run(const Options& opt) {
     }
 
     const JsonValue root = doc.root();
-    if (root["event"].AsString() != "property-change") continue;
+    const JsonValue event = root["event"];
 
-    const std::string_view prop = root["name"].AsString();
+    if (event.valid()) {
+      if (event.AsString() != "property-change") continue;
 
-    if (prop == "frame-drop-count") {
-      drop_total = static_cast<uint32_t>(root["data"].AsInt(0));
+      const std::string_view prop = root["name"].AsString();
+
+      if (prop == "frame-drop-count") {
+        drop_total = static_cast<uint32_t>(root["data"].AsInt(0));
+        continue;
+      }
+      if (prop == "vo-delayed-frame-count") {
+        delayed_total = static_cast<uint32_t>(root["data"].AsInt(0));
+        continue;
+      }
+      if (prop != "playback-time") continue;
+
+      const double position = root["data"].AsDouble(-1.0);
+      if (position >= 0.0) {
+        auto position_ns = static_cast<int64_t>(position * 1e9);
+
+        // looping restarts the clock at zero. without an epoch offset the key
+        // would jump backwards, and the correlator relies on a key that only
+        // ever increases
+        if (position_ns + kLoopBackstepNs < last_position_ns) {
+          media_epoch_ns += last_position_ns;
+          ++loops;
+        }
+        last_position_ns = position_ns;
+        media_time_ns = media_epoch_ns + position_ns;
+      }
+
+      // a new frame was presented, so ask for the pass timings behind it. the
+      // reply is handled below when the answer comes back
+      ++frame_ticks;
+      if (outstanding_polls < kMaxOutstandingPolls &&
+          client.GetProperty("vo-passes", kPollIdBase + next_poll_id)) {
+        ++next_poll_id;
+        ++outstanding_polls;
+      }
       continue;
     }
-    if (prop == "vo-delayed-frame-count") {
-      delayed_total = static_cast<uint32_t>(root["data"].AsInt(0));
+
+    // not an event, so this is a reply to a command. only the vo-passes pulls
+    // carry an id at or above the base, everything lower is an observe ack
+    const int64_t request_id = root["request_id"].AsInt(-1);
+    if (request_id < kPollIdBase) continue;
+
+    if (outstanding_polls > 0) --outstanding_polls;
+    if (root["error"].AsString() != "success") {
+      ++poll_errors;
       continue;
     }
-    if (prop != "vo-passes") continue;
 
     const JsonValue data = root["data"];
     // mpv splits passes into work done for a new frame and work done to redraw
@@ -238,8 +315,15 @@ int Run(const Options& opt) {
 
     TelemetryRecord rec{};
     rec.t_mono_ns = MonotonicNanos();
-    ReadPasses(passes, &rec, &names);
+    const unsigned seen_passes = ReadPasses(passes, &rec, &names);
     if (rec.pass_count == 0) continue;
+    if (seen_passes > rec.pass_count && overflow_warned == 0) {
+      std::fprintf(stderr,
+                   "framewire-producer: chain has %u passes, only the first %u are listed "
+                   "individually. the gpu total still covers all of them\n",
+                   seen_passes, static_cast<unsigned>(kMaxPasses));
+      overflow_warned = 1;
+    }
 
     // republish the directory only when the chain actually changes, so the
     // consumer is not rereading names on every single frame
@@ -255,6 +339,7 @@ int Run(const Options& opt) {
     }
 
     rec.seq = ++seq;
+    rec.media_time_ns = media_time_ns;
     rec.layout_version = layout.version;
     rec.frame_time_ns = last_frame_ns == 0 ? 0 : rec.t_mono_ns - last_frame_ns;
     last_frame_ns = rec.t_mono_ns;
@@ -266,7 +351,7 @@ int Run(const Options& opt) {
 
     rec.dropped_total = drop_total;
     rec.delayed_total = delayed_total;
-    rec.flags = flags;
+    rec.flags |= flags;
     StampChecksum(rec);
 
     producer.TryPush(rec);
@@ -274,10 +359,23 @@ int Run(const Options& opt) {
 
   producer.MarkDone();
   std::fprintf(stderr,
-               "framewire-producer: stopped after %llu records, %llu ring drops, %llu parse errors\n",
+               "framewire-producer: stopped after %llu records from %llu frame ticks, "
+               "%llu ring drops, %llu parse errors, %llu property errors\n",
                static_cast<unsigned long long>(seq),
+               static_cast<unsigned long long>(frame_ticks),
                static_cast<unsigned long long>(producer.dropped()),
-               static_cast<unsigned long long>(parse_errors));
+               static_cast<unsigned long long>(parse_errors),
+               static_cast<unsigned long long>(poll_errors));
+  if (loops > 0) {
+    std::fprintf(stderr, "framewire-producer: video looped %llu times\n",
+                 static_cast<unsigned long long>(loops));
+  }
+
+  if (seq == 0) {
+    std::fprintf(stderr,
+                 "framewire-producer: no pass timings arrived. mpv only fills in vo-passes for "
+                 "--vo=gpu or --vo=gpu-next\n");
+  }
 
   // the ring is deliberately left mapped until this process exits, so a
   // consumer still draining the tail keeps a valid segment underneath

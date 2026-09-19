@@ -179,4 +179,21 @@ void JsonEscapeTo(std::string& out, std::string_view value);
  */
 std::string BuildMpvCommand(const std::vector<std::string>& args, int64_t request_id);
 
+/*
+ * Builds an observe_property command.
+ *
+ * The observe id has to go out as a JSON number. mpv answers a quoted id with
+ * "invalid parameter" and then silently never sends the property, so this
+ * command cannot reuse the all strings builder above.
+ *
+ * Args:
+ *   observe_id: Identifier mpv stamps on every change event for the property.
+ *   property: Property name to watch.
+ *   request_id: Value echoed back by mpv in the reply.
+ * Returns:
+ *   A single line of JSON ending in a newline.
+ */
+std::string BuildMpvObserveCommand(int64_t observe_id, std::string_view property,
+                                   int64_t request_id);
+
 }  // namespace framewire

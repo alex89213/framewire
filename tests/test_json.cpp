@@ -222,6 +222,24 @@ void TestWriter() {
     CHECK(doc.root()["command"][0].AsString() == "observe_property");
   }
 
+  TEST_CASE("the observe id goes out as a number, not a string") {
+    const std::string cmd = BuildMpvObserveCommand(2, "vo-passes", 7);
+    CHECK(cmd == "{\"command\":[\"observe_property\",2,\"vo-passes\"],\"request_id\":7}\n");
+
+    // mpv answers a quoted observe id with "invalid parameter" and then never
+    // sends the property, so the type of this one field decides whether the
+    // producer captures anything at all
+    JsonDoc doc;
+    CHECK(doc.Parse(cmd.substr(0, cmd.size() - 1)));
+    const JsonValue command = doc.root()["command"];
+    CHECK_EQ(command.size(), 3);
+    CHECK(command[0].is_string());
+    CHECK(command[1].is_number());
+    CHECK(!command[1].is_string());
+    CHECK_EQ(command[1].AsInt(), 2);
+    CHECK(command[2].is_string());
+  }
+
   TEST_CASE("a control character survives escaping") {
     std::string out;
     JsonEscapeTo(out, std::string("a\x01"

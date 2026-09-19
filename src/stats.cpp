@@ -182,6 +182,26 @@ void StreamAggregator::ResetStats() {
   last_ts_ = 0;
 }
 
+/*
+ * Picks the value two records are matched on.
+ *
+ * Media position is the right key whenever mpv supplies one. Two players
+ * started by hand are never phase locked, so arrival times carry an arbitrary
+ * constant offset between the streams, and at 24 fps that offset is routinely
+ * larger than any sensible tolerance. Media position does not have that
+ * problem, because the same frame of the same file carries the same position
+ * in both players.
+ *
+ * Args:
+ *   rec: Record to read a key from.
+ * Returns:
+ *   Media position when present, otherwise the monotonic arrival stamp.
+ */
+int64_t Correlator::PairingKey(const TelemetryRecord& rec) const {
+  if (use_media_time_ && rec.media_time_ns > 0) return rec.media_time_ns;
+  return static_cast<int64_t>(rec.t_mono_ns);
+}
+
 Correlator::Correlator(uint64_t tolerance_ns) : tolerance_ns_(tolerance_ns) {
   pass_delta_.reserve(kMaxPasses);
   pass_a_.reserve(kMaxPasses);
@@ -194,11 +214,19 @@ Correlator::Correlator(uint64_t tolerance_ns) : tolerance_ns_(tolerance_ns) {
 }
 
 void Correlator::PushA(const std::vector<TelemetryRecord>& records) {
-  for (const auto& r : records) queue_a_.push_back(r);
+  for (const auto& r : records) {
+    if (r.media_time_ns > 0) media_seen_a_ = true;
+    queue_a_.push_back(r);
+  }
+  use_media_time_ = media_seen_a_ && media_seen_b_;
 }
 
 void Correlator::PushB(const std::vector<TelemetryRecord>& records) {
-  for (const auto& r : records) queue_b_.push_back(r);
+  for (const auto& r : records) {
+    if (r.media_time_ns > 0) media_seen_b_ = true;
+    queue_b_.push_back(r);
+  }
+  use_media_time_ = media_seen_a_ && media_seen_b_;
 }
 
 void Correlator::Process(bool flush) {
@@ -206,13 +234,17 @@ void Correlator::Process(bool flush) {
     const TelemetryRecord& a = queue_a_.front();
     const TelemetryRecord& b = queue_b_.front();
 
-    if (a.t_mono_ns + tolerance_ns_ < b.t_mono_ns) {
+    const int64_t key_a = PairingKey(a);
+    const int64_t key_b = PairingKey(b);
+    const int64_t window = static_cast<int64_t>(tolerance_ns_);
+
+    if (key_a + window < key_b) {
       // every later b is further away still, so this a can never be matched
       ++unmatched_a_;
       queue_a_.pop_front();
       continue;
     }
-    if (b.t_mono_ns + tolerance_ns_ < a.t_mono_ns) {
+    if (key_b + window < key_a) {
       ++unmatched_b_;
       queue_b_.pop_front();
       continue;
@@ -305,6 +337,9 @@ void Correlator::Reset() {
   unmatched_a_ = 0;
   unmatched_b_ = 0;
   a_faster_ = 0;
+  use_media_time_ = false;
+  media_seen_a_ = false;
+  media_seen_b_ = false;
 }
 
 std::string FormatNanos(uint64_t ns) {

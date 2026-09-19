@@ -96,7 +96,15 @@ bool MpvIpcClient::SendCommand(const std::vector<std::string>& args, int64_t req
     return false;
   }
 
-  const std::string line = BuildMpvCommand(args, request_id);
+  return SendRaw(BuildMpvCommand(args, request_id));
+}
+
+bool MpvIpcClient::SendRaw(const std::string& line) {
+  if (fd_ < 0) {
+    last_error_ = "not connected";
+    return false;
+  }
+
   size_t sent = 0;
   while (sent < line.size()) {
     // MSG_NOSIGNAL keeps a closed socket from killing the process with SIGPIPE
@@ -121,7 +129,15 @@ bool MpvIpcClient::SendCommand(const std::vector<std::string>& args, int64_t req
 }
 
 bool MpvIpcClient::ObserveProperty(int64_t observe_id, const std::string& property) {
-  return SendCommand({"observe_property", std::to_string(observe_id), property}, observe_id);
+  if (fd_ < 0) {
+    last_error_ = "not connected";
+    return false;
+  }
+  return SendRaw(BuildMpvObserveCommand(observe_id, property, observe_id));
+}
+
+bool MpvIpcClient::GetProperty(const std::string& property, int64_t request_id) {
+  return SendCommand({"get_property", property}, request_id);
 }
 
 bool MpvIpcClient::TakeBufferedLine(std::string* out_line) {

@@ -91,8 +91,8 @@ void FillRecord(uint64_t seq, TelemetryRecord* rec) {
   rec->t_mono_ns = 0;
   rec->frame_time_ns = seq * 2654435761ull;
   rec->gpu_total_ns = 0;
-  rec->reserved[0] = ~seq;
-  rec->reserved[1] = seq * 1099511628211ull;
+  rec->media_time_ns = static_cast<int64_t>(seq * 41666666ull);
+  rec->reserved = seq * 1099511628211ull;
 
   rec->pass_count = static_cast<uint8_t>(1 + (seq % kMaxPasses));
   for (unsigned i = 0; i < kMaxPasses; ++i) {

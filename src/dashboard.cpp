@@ -287,6 +287,19 @@ std::string BuildTextReport(const StreamSnapshot& a, const StreamSnapshot& b,
   stream_block(a, "a");
   stream_block(b, "b");
 
+  // two players rendering the same file should present at the same rate. a
+  // large split means one window is not rendering normally, which on a
+  // compositor that throttles hidden surfaces produces timings that look fast
+  // but describe almost no work
+  const double fps_hi = std::max(a.fps, b.fps);
+  const double fps_lo = std::min(a.fps, b.fps);
+  if (fps_hi > 1.0 && (fps_hi - fps_lo) / fps_hi > 0.10) {
+    line(Format("[warning] frame rates differ by %.0f%% (%.1f vs %.1f). one player may be "
+                "occluded or throttled, so the comparison below is not trustworthy",
+                100.0 * (fps_hi - fps_lo) / fps_hi, a.fps, b.fps));
+    line("");
+  }
+
   line("[comparison] paired frames only");
   line(Format("  paired           %llu", static_cast<unsigned long long>(cmp.paired)));
   line(Format("  unmatched a / b  %llu / %llu", static_cast<unsigned long long>(cmp.unmatched_a),

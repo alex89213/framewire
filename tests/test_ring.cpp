@@ -39,7 +39,7 @@ TelemetryRecord MakeRecord(uint64_t seq) {
 
 void TestLayoutInvariants() {
   TEST_CASE("record and header layout are pinned") {
-    CHECK_EQ(sizeof(TelemetryRecord), 128);
+    CHECK_EQ(sizeof(TelemetryRecord), 192);
     CHECK_EQ(alignof(TelemetryRecord), 64);
     CHECK_EQ(kChecksumCoverage, sizeof(TelemetryRecord) - sizeof(uint32_t));
 

@@ -148,16 +148,66 @@ bool SendLine(int fd, const std::string& line) {
   return true;
 }
 
-// Answers a command the way mpv does, so the producer sees a normal handshake.
-void HandleCommand(int fd, const std::string& line) {
+/*
+ * Answers a command the way real mpv does.
+ *
+ * The strictness here is the point. An earlier version of this mock answered
+ * every command with success, which hid a real bug: the producer was sending
+ * the observe id as a quoted string, and mpv rejects that with "invalid
+ * parameter" and then never sends the property at all. A mock that accepts
+ * anything is worse than no mock, because the mock reports a green run while
+ * the real thing captures nothing.
+ *
+ * Args:
+ *   fd: Client socket.
+ *   line: One received command.
+ *   passes_json: Current vo-passes payload to answer a get_property with.
+ * Returns:
+ *   True when the command was understood and answered with success.
+ */
+bool HandleCommand(int fd, const std::string& line, const std::string& passes_json) {
   JsonDoc doc;
-  if (!doc.Parse(line)) return;
-  const int64_t request_id = doc.root()["request_id"].AsInt(0);
+  if (!doc.Parse(line)) return false;
+
+  const JsonValue root = doc.root();
+  const int64_t request_id = root["request_id"].AsInt(0);
+  const JsonValue command = root["command"];
+  const std::string_view name = command[0].AsString();
+
+  auto fail = [&](const char* error) {
+    std::string reply = "{\"error\":\"";
+    reply += error;
+    reply += "\",\"data\":null,\"request_id\":";
+    reply += std::to_string(request_id);
+    reply += "}\n";
+    SendLine(fd, reply);
+    return false;
+  };
+
+  if (name == "observe_property") {
+    // mpv wants the observe id as a JSON number and refuses a quoted one
+    if (!command[1].is_number()) return fail("invalid parameter");
+    if (!command[2].is_string()) return fail("invalid parameter");
+  } else if (name == "get_property") {
+    if (!command[1].is_string()) return fail("invalid parameter");
+
+    if (command[1].AsString() == "vo-passes") {
+      if (passes_json.empty()) return fail("property unavailable");
+      std::string reply = "{\"error\":\"success\",\"data\":";
+      reply += passes_json;
+      reply += ",\"request_id\":" + std::to_string(request_id) + "}\n";
+      SendLine(fd, reply);
+      return true;
+    }
+  } else if (name.empty()) {
+    return fail("invalid parameter");
+  }
 
   std::string reply = "{\"error\":\"success\",\"data\":null,\"request_id\":";
   reply += std::to_string(request_id);
   reply += "}\n";
   SendLine(fd, reply);
+  return true;
 }
 
 int Run(const Options& opt) {
@@ -212,7 +262,7 @@ int Run(const Options& opt) {
         read_buffer.append(chunk, static_cast<size_t>(n));
         size_t nl;
         while ((nl = read_buffer.find('\n')) != std::string::npos) {
-          HandleCommand(client, read_buffer.substr(0, nl));
+          HandleCommand(client, read_buffer.substr(0, nl), payload);
           read_buffer.erase(0, nl + 1);
         }
       }
@@ -232,7 +282,7 @@ int Run(const Options& opt) {
     // a lognormal multiplier gives a right leaning tail, which is what real
     // gpu pass timings look like. a plain uniform spread would make the p99
     // and p999 columns uninteresting
-    payload = "{\"event\":\"property-change\",\"id\":1,\"name\":\"vo-passes\",\"data\":{\"fresh\":[";
+    payload = "{\"fresh\":[";
     for (size_t i = 0; i < passes.size(); ++i) {
       std::lognormal_distribution<double>::param_type p(0.0, passes[i].sigma);
       jitter.param(p);
@@ -247,9 +297,19 @@ int Run(const Options& opt) {
       payload += ",\"peak\":" + std::to_string(ns * 2);
       payload += "}";
     }
-    payload += "],\"redraw\":[]}}\n";
+    payload += "],\"redraw\":[]}";
 
-    if (!SendLine(client, payload)) break;
+    // real mpv only sends vo-passes when asked, so the mock keeps the payload
+    // ready and announces the frame through playback-time, matching the
+    // protocol the producer actually has to speak
+    const double playback_time =
+        static_cast<double>(frames) / (opt.fps > 0.1 ? opt.fps : 0.1);
+    char tick[160];
+    std::snprintf(tick, sizeof(tick),
+                  "{\"event\":\"property-change\",\"id\":1,\"name\":\"playback-time\","
+                  "\"data\":%.6f}\n",
+                  playback_time);
+    if (!SendLine(client, tick)) break;
 
     if (opt.drop_rate > 0.0 && uniform(rng) < opt.drop_rate) {
       ++drops;

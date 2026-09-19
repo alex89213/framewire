@@ -481,6 +481,18 @@ void JsonEscapeTo(std::string& out, std::string_view value) {
   out.push_back('"');
 }
 
+std::string BuildMpvObserveCommand(int64_t observe_id, std::string_view property,
+                                   int64_t request_id) {
+  std::string out = "{\"command\":[\"observe_property\",";
+  out += std::to_string(observe_id);  // a number, not a quoted string
+  out.push_back(',');
+  JsonEscapeTo(out, property);
+  out += "],\"request_id\":";
+  out += std::to_string(request_id);
+  out += "}\n";
+  return out;
+}
+
 std::string BuildMpvCommand(const std::vector<std::string>& args, int64_t request_id) {
   std::string out = "{\"command\":[";
   for (size_t i = 0; i < args.size(); ++i) {

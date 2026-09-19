@@ -159,6 +159,14 @@ std::string LabelFor(const RingMapping& m, const std::string& override_label,
 int Run(const Options& opt) {
   Terminal::InstallSignalHandlers();
 
+  // two consumers on one ring would each take a share of the records and
+  // neither would see the full stream, which breaks the single consumer rule
+  // the whole queue is built on
+  if (opt.shm_a == opt.shm_b) {
+    throw std::runtime_error("--shm-a and --shm-b must name different rings, both are '" +
+                             opt.shm_a + "'");
+  }
+
   std::fprintf(stderr, "framewire: waiting for rings %s and %s\n", opt.shm_a.c_str(),
                opt.shm_b.c_str());
 

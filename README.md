@@ -16,7 +16,8 @@ the built in scaler, and where does the difference land in the pass breakdown.
 ```
   mpv instance A                    mpv instance B
   --input-ipc-server=/tmp/a.sock    --input-ipc-server=/tmp/b.sock
-        |  vo-passes JSON                 |  vo-passes JSON
+        |  playback-time tick             |  playback-time tick
+        |  get_property vo-passes         |  get_property vo-passes
         v                                 v
   framewire-producer                framewire-producer
         |  lock free push                 |  lock free push
@@ -26,7 +27,7 @@ the built in scaler, and where does the difference land in the pass breakdown.
         +---------------+-----------------+
                         v
                     framewire
-          correlate by monotonic timestamp
+          correlate by media position
           p50 / p99 / p999, per pass deltas
                         v
                  terminal dashboard
@@ -204,7 +205,7 @@ dashboard so a reader always knows when a number is incomplete.
 
 ### Records
 
-`TelemetryRecord` is exactly 128 bytes, trivially copyable, and made only of
+`TelemetryRecord` is exactly 192 bytes, trivially copyable, and made only of
 fixed width integers with no pointers, because the struct lives in memory that
 each process maps at a different address. The size is pinned by `static_assert`
 and is part of the shared memory ABI, which the header version guards.
@@ -237,12 +238,32 @@ costs nothing and is exact.
 
 ### Correlating the two streams
 
-The two players are never frame locked, so the streams drift against each
-other. Matching is a merge over both queues, and the decision only ever needs
+Frames are matched on media position, not arrival time. This was the single
+biggest correctness fix that real usage forced.
+
+Arrival time seems like the obvious key and does not work. Two players started
+by hand are never phase locked, so their frames land at some arbitrary constant
+offset from each other. That offset is bounded by one frame interval, but a
+frame interval at 24 fps is 41ms, and any tolerance small enough to be
+meaningful is smaller than the typical offset. Measured against a real pair of
+mpv instances, matching on arrival time paired 29 frames out of 435.
+
+Media position does not have that problem. Both players decode the same file,
+so the same frame carries the same position in both regardless of when either
+one got around to drawing it. mpv reports the position through `playback-time`,
+which the producer is already watching as its frame clock, so the key costs
+nothing extra to collect. The same pair of players then matched 434 frames out
+of 436.
+
+Looping breaks the key by resetting the position to zero, so the producer adds
+an epoch offset on every restart and hands the correlator a value that only
+increases. Arrival time is still used as a fallback when a stream carries no
+media position at all.
+
+Matching itself is a merge over both queues, and the decision only ever needs
 the front record of each side. If the earlier record is outside the tolerance
 window of the other side's front, no future record can be closer, so the record
-retires as unmatched rather than being paired with something unrelated. The
-default window is 8ms, about half a frame at 60 fps.
+retires as unmatched rather than being paired with something unrelated.
 
 Every comparative number comes from paired frames only. Comparing the two
 independent averages would be misleading, because the two instances can render
@@ -309,7 +330,7 @@ two records would be caught even if both halves were individually valid.
 Across all five runs, 100 million records total: zero checksum errors, zero
 payload mismatches, zero ordering faults, zero missing records.
 
-The record is 128 bytes, so a single ring sustains a rate several thousand
+The record is 192 bytes, so a single ring sustains a rate several thousand
 times higher than the roughly 60 to 240 records a second a real player
 produces. The transport is not the bottleneck and was never going to be. The
 point of measuring is to show the headroom is large enough that the
@@ -339,13 +360,60 @@ Pushing both streams to 240 fps raises the producer to 0.55% of a core and the
 consumer to 1.55%. The producer cost is what matters, since that process is the
 one sharing a machine with the players being measured.
 
-### A note on the shader numbers
+### Real shaders
 
-The per shader timings in this README come from the mock mpv server, whose pass
-timings are synthetic and shaped to resemble a real GPU shader chain. The
-numbers demonstrate the tool, not a real ESPCN result. Running
-`scripts/run_comparison.sh` against a real video on a real GPU is what produces
-real numbers, and the report format is identical either way.
+Measured with `scripts/run_comparison.sh` against real mpv on real hardware, not
+the mock. Source is a 960x540 h264 clip, each shader is a 2x luma upscaler, and
+each run pairs two mpv instances side by side for 20 seconds with
+`--vo=gpu-next`. Numbers are total GPU time per frame across every pass.
+
+| A | B | A p50 | B p50 | delta p50 | A cheaper on |
+| --- | --- | --- | --- | --- | --- |
+| espcn_x2_8 | bilinear built in | 5.14ms | 226us | -4.91ms | 0% |
+| espcn_x2_8 | FSRCNNX_x2_8 | 4.17ms | 5.70ms | +1.51ms | 99.8% |
+| espcn_x2_8 | FSRCNNX_x2_16 | 5.14ms | 10.08ms | +4.73ms | 99.8% |
+| FSR | NVScaler | 2.34ms | 4.41ms | +2.04ms | 99.8% |
+
+Chain lengths differ a lot more than the file sizes suggest:
+
+| Shader | Passes |
+| --- | --- |
+| built in scaler, no shader | 3 |
+| NVScaler | 3 |
+| FSR | 4 |
+| espcn_x2_8 | 9 |
+| FSRCNNX_x2_8 | 18 |
+| FSRCNNX_x2_16 | 30 |
+
+Two things are worth saying about how these were read.
+
+The bilinear row is the sanity check, not a result. A neural upscaler costing
+roughly 20 times a bilinear filter is the expected shape, and seeing that shape
+is what confirms the tool measures what it claims to.
+
+The FSRCNNX rows were wrong the first time. The record held 16 pass slots, both
+FSRCNNX chains are longer than that, and the overflow was silently dropped from
+the GPU total. That made FSRCNNX_x2_8 look tied with espcn at 4.65ms against
+4.68ms. With every pass counted the same comparison is 5.70ms against 4.17ms.
+The fix was to raise the cap to 32 and, more importantly, to keep summing the
+total past the cap so a chain longer than the table can still report an honest
+total. A truncated measurement that looks plausible is worse than one that
+obviously fails.
+
+### Reading these numbers carefully
+
+Both players share one GPU, so they contend with each other. That is fair in
+the sense that both sides pay it, but absolute timings from a paired run sit
+below what the same shader costs alone. Cross checking FSRCNNX_x2_16 against a
+solo measurement taken straight from mpv gave 10.6ms against the 10.08ms the
+paired run reported, which is close enough to trust the comparison.
+
+One run produced an implausible result, a 30 pass network reporting less GPU
+time than a 9 pass one, and it did not reproduce. The likely cause is a window
+that was not rendering normally, since a compositor can throttle a surface that
+is hidden or off screen. The report now prints a warning when the two players
+present at rates more than 10 percent apart, because that split is the visible
+symptom of the problem. Keep both windows fully visible when measuring.
 
 ## Testing
 
@@ -368,8 +436,8 @@ build/framewire-stress --records 20000000 --capacity 4096
 Options exist to stall either side on purpose (`--slow-consumer`,
 `--slow-producer`) to exercise the backpressure path.
 
-Three bugs were found by this suite during the build and are worth naming,
-since all three were silent:
+Bugs found during the build, all of them silent, which is why each one is
+named here along with what caught it:
 
 1. The histogram computed its bucket zero index with unsigned arithmetic, so
    every sample below 512 wrapped and landed in the top bucket. p999 came back
@@ -382,6 +450,20 @@ since all three were silent:
    longer than the staleness window. The producer then spun forever on a full
    ring. Only visible on runs past two seconds, which is why a short smoke test
    never saw it.
+4. `observe_property` was sending the observe id as a quoted string. mpv wants
+   a JSON number, answers a quoted one with "invalid parameter", and then
+   simply never sends the property. The producer captured nothing at all
+   against real mpv. The mock server had been answering every command with
+   success, so the whole test suite stayed green while the tool was completely
+   broken. The mock now validates argument types the way mpv does, and a test
+   asserts the id is encoded as a number.
+5. The pass table held 16 entries and quietly dropped anything past that,
+   including from the GPU total, which made longer chains look cheaper. Covered
+   above in the benchmark section.
+
+The fourth one is the reason the mock is now strict. A mock that accepts
+anything reports a green run while the real integration captures nothing, which
+is worse than having no mock at all.
 
 ## Platform
 

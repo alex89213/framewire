@@ -194,8 +194,19 @@ class Correlator {
   size_t PendingA() const { return queue_a_.size(); }
   size_t PendingB() const { return queue_b_.size(); }
 
+  // Pairing key for a record, media position when available.
+  int64_t PairingKey(const TelemetryRecord& rec) const;
+
+  bool pairing_on_media_time() const { return use_media_time_; }
+
  private:
   uint64_t tolerance_ns_;
+
+  // set once both sides have supplied a media position. mixing keys would be
+  // meaningless, so the choice is made from what both streams actually carry
+  bool use_media_time_ = false;
+  bool media_seen_a_ = false;
+  bool media_seen_b_ = false;
 
   std::deque<TelemetryRecord> queue_a_;
   std::deque<TelemetryRecord> queue_b_;
