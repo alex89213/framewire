@@ -342,23 +342,31 @@ intended trade for an integrity harness.
 
 ### End to end
 
-The full pipeline against the mock server, two players and two producers
-feeding one dashboard, 30 seconds at 60 fps per stream:
+Instrumentation overhead, measured with the current protocol, which issues one
+`get_property vo-passes` per frame. Both producers and the dashboard running,
+CPU read from `/proc` as a share of one core.
 
-| Measure | Value |
-| --- | --- |
-| Frames captured per stream | 1819 |
-| Frames paired across streams | 1819 |
-| Unmatched frames | 0 |
-| Records lost to a full ring | 0 |
-| Checksum errors | 0 |
-| Sequence gaps | 0 |
-| Producer CPU | 0.10% of one core |
-| Consumer CPU, dashboard at 10 Hz | 0.97% of one core |
+| Setup | Producer CPU | Consumer CPU |
+| --- | --- | --- |
+| real mpv, 24 fps per stream | 0.12% | 0.67% |
+| mock, 60 fps per stream | 0.14% | 0.93% |
+| mock, 240 fps per stream | 0.68% | 2.16% |
 
-Pushing both streams to 240 fps raises the producer to 0.55% of a core and the
-consumer to 1.55%. The producer cost is what matters, since that process is the
-one sharing a machine with the players being measured.
+The producer number is the one that matters, since that process shares a
+machine with the players being measured. The consumer can be moved to another
+terminal or another core and does not touch the render path.
+
+Capture is lossless in all three. A 25 second run against real mpv with the
+ESPCN and FSRCNNX shaders captured 609 frames from each player, paired all 609,
+and recorded zero unmatched frames, zero records lost to a full ring, zero
+checksum failures and zero sequence gaps. The 30 second mock run at 60 fps
+captured 1824 frames per stream on the same terms.
+
+These figures replace an earlier set taken before the IPC protocol changed.
+Subscribing to `vo-passes` turned out not to work, so each frame now costs a
+request and a reply instead of an unsolicited event, which moved the producer
+from 0.10% to 0.14% at 60 fps. Worth knowing when reading the number, and still
+small enough not to matter.
 
 ### Real shaders
 
