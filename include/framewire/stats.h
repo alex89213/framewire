@@ -51,7 +51,12 @@ struct PassView {
 struct StreamSnapshot {
   std::string label;
   uint64_t records = 0;
-  double fps = 0.0;
+  double fps = 0.0;         // over the whole run
+  double fps_recent = 0.0;  // over the recent window, so a stall shows up
+
+  // most recent sample, for watching a single frame rather than a distribution
+  uint64_t gpu_last = 0;
+  uint64_t frame_last = 0;
 
   QuantileSet frame_time_recent;
   QuantileSet frame_time_life;

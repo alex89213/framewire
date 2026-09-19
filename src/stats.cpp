@@ -135,6 +135,14 @@ StreamSnapshot StreamAggregator::Snapshot() const {
     s.fps = static_cast<double>(records_ - 1) * 1e9 / static_cast<double>(span);
   }
 
+  // a run long average barely moves when a player starts stuttering, so the
+  // live rate is derived from the recent frame gaps instead
+  const double recent_gap = frame_time_window_.Mean();
+  if (recent_gap > 0.0) s.fps_recent = 1e9 / recent_gap;
+
+  s.gpu_last = gpu_window_.Newest();
+  s.frame_last = frame_time_window_.Newest();
+
   s.frame_time_recent = FromWindow(frame_time_window_);
   s.frame_time_life = FromHistogram(frame_time_hist_);
   s.gpu_recent = FromWindow(gpu_window_);

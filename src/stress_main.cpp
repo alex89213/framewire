@@ -39,6 +39,7 @@ struct Options {
   unsigned slow_consumer_every = 0;  // pause the consumer every N records
   unsigned slow_producer_every = 0;
   bool quiet = false;
+  bool verify = true;  // off measures the queue itself rather than the checks
 };
 
 /*
@@ -69,6 +70,7 @@ void PrintUsage() {
                "  --shm NAME        segment name (default /framewire-stress)\n"
                "  --slow-consumer N stall the consumer every N records\n"
                "  --slow-producer N stall the producer every N records\n"
+               "  --no-verify       skip checksums and payload rebuild, to time the queue\n"
                "  --quiet           only print the verdict\n");
 }
 
@@ -143,10 +145,19 @@ void RunProducer(const Options& opt, Results* results) {
   uint64_t dropped = 0;
 
   TelemetryRecord rec;
+  FillRecord(1, &rec);  // reused when not verifying, only seq changes per push
+
   for (uint64_t seq = 1; seq <= opt.records; ++seq) {
-    FillRecord(seq, &rec);
-    rec.t_mono_ns = MonotonicNanos();
-    StampChecksum(rec);
+    if (opt.verify) {
+      // fnv1a over 124 bytes, plus rebuilding the payload, is most of the per
+      // record cost. that is the right trade for an integrity run and the
+      // wrong one for measuring the queue, hence the two modes
+      FillRecord(seq, &rec);
+      rec.t_mono_ns = MonotonicNanos();
+      StampChecksum(rec);
+    } else {
+      rec.seq = seq;
+    }
 
     // the heartbeat has to keep ticking through the push loop. without it the
     // consumer sees a stale stamp, decides the producer died and exits early,
@@ -227,8 +238,10 @@ void RunConsumer(const Options& opt, Results* results) {
     for (size_t i = 0; i < n; ++i) {
       const TelemetryRecord& rec = batch[i];
 
-      if (!VerifyChecksum(rec)) ++checksum_errors;
-      if (!PayloadMatches(rec)) ++payload_errors;
+      if (opt.verify) {
+        if (!VerifyChecksum(rec)) ++checksum_errors;
+        if (!PayloadMatches(rec)) ++payload_errors;
+      }
 
       // the producer retries instead of dropping, so a gap here means a record
       // went missing, which would be a real fault in the queue
@@ -276,7 +289,10 @@ int Run(const Options& opt) {
     std::printf("  records   %" PRIu64 "\n", opt.records);
     std::printf("  capacity  %u slots (%.2f MiB)\n", opt.capacity,
                 static_cast<double>(RingBytes(opt.capacity)) / 1048576.0);
-    std::printf("  record    %zu bytes\n\n", sizeof(TelemetryRecord));
+    std::printf("  record    %zu bytes\n", sizeof(TelemetryRecord));
+    std::printf("  mode      %s\n\n",
+                opt.verify ? "integrity, every record checksummed and rebuilt"
+                           : "throughput, queue only with checks disabled");
   }
 
   const pid_t consumer_pid = fork();
@@ -389,6 +405,8 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
       const char* v = next("--slow-producer");
       if (!v) return false;
       opt->slow_producer_every = static_cast<unsigned>(std::strtoul(v, nullptr, 10));
+    } else if (arg == "--no-verify") {
+      opt->verify = false;
     } else if (arg == "--quiet") {
       opt->quiet = true;
     } else if (arg == "--help" || arg == "-h") {

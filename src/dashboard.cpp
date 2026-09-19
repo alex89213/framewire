@@ -56,17 +56,19 @@ std::vector<std::string> BuildPanel(const StreamSnapshot& s, const DashboardStat
   rows.push_back(Format("%s%s%s", Colour(st, ansi::kGrey), Repeat("─", width).c_str(),
                         Colour(st, ansi::kReset)));
 
-  rows.push_back(Format("gpu    p50 %-8s p99 %-8s p999 %s", FormatNanos(s.gpu_recent.p50).c_str(),
+  rows.push_back(Format("gpu    now %-8s p50 %-8s p99 %-8s p999 %s",
+                        FormatNanos(s.gpu_last).c_str(), FormatNanos(s.gpu_recent.p50).c_str(),
                         FormatNanos(s.gpu_recent.p99).c_str(),
                         FormatNanos(s.gpu_recent.p999).c_str()));
-  rows.push_back(Format("frame  p50 %-8s p99 %-8s p999 %s",
+  rows.push_back(Format("frame  now %-8s p50 %-8s p99 %-8s p999 %s",
+                        FormatNanos(s.frame_last).c_str(),
                         FormatNanos(s.frame_time_recent.p50).c_str(),
                         FormatNanos(s.frame_time_recent.p99).c_str(),
                         FormatNanos(s.frame_time_recent.p999).c_str()));
   rows.push_back(Format("life   p50 %-8s p99 %-8s max  %s", FormatNanos(s.gpu_life.p50).c_str(),
                         FormatNanos(s.gpu_life.p99).c_str(), FormatNanos(s.gpu_life.max).c_str()));
 
-  rows.push_back(Format("fps    %-8.1f frames %-10llu", s.fps,
+  rows.push_back(Format("fps    %.1f now  %.1f avg   frames %llu", s.fps_recent, s.fps,
                         static_cast<unsigned long long>(s.records)));
 
   const double drop_rate =
@@ -258,7 +260,7 @@ std::string BuildTextReport(const StreamSnapshot& a, const StreamSnapshot& b,
   auto stream_block = [&](const StreamSnapshot& s, const char* tag) {
     line(Format("[%s] %s", tag, s.label.c_str()));
     line(Format("  frames           %llu", static_cast<unsigned long long>(s.records)));
-    line(Format("  fps              %.2f", s.fps));
+    line(Format("  fps              %.2f run, %.2f recent", s.fps, s.fps_recent));
     line(Format("  gpu p50/p99/p999 %s / %s / %s", FormatNanos(s.gpu_life.p50).c_str(),
                 FormatNanos(s.gpu_life.p99).c_str(), FormatNanos(s.gpu_life.p999).c_str()));
     line(Format("  gpu max          %s", FormatNanos(s.gpu_life.max).c_str()));
