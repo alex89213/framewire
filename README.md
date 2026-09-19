@@ -39,8 +39,11 @@ difference land in the pass breakdown.
 | For | Needs |
 | --- | --- |
 | Building and testing | a C++20 compiler, CMake 3.16 or newer |
-| Measuring real shaders | `mpv` built with the `gpu` or `gpu-next` video output |
+| Measuring real shaders | `mpv` run with `--vo=gpu` or `--vo=gpu-next` |
 | The quality pass | `ffmpeg`, `python3` |
+
+mpv only fills in the `vo-passes` property for the GPU video outputs, so one of
+those two is required. The scripts pass it for you.
 
 The tool itself links nothing outside the C++ standard library and POSIX. The
 unit tests and the ring benchmark run headless, with no GPU and no display.
@@ -89,6 +92,15 @@ scripts/compare.sh video.mkv shader:espcn_x2_8.glsl builtin:ewa_lanczossharp
   espcn_x2_8 costs 3.09x less GPU time for the same picture, so it wins on cost alone
 ```
 
+The verdict compares the quality gap against the frame to frame spread rather
+than a fixed threshold. A 0.02 dB difference across frames that vary by 0.39 dB
+between themselves is not a result, and calling it one would be the same
+mistake as quoting a truncated pass total.
+
+Every mpv instance is launched with `--no-config`, because a user `mpv.conf`
+can set a scaler, a shader or a profile that would change the measurement
+without appearing anywhere in the output.
+
 Tunable through the environment:
 
 | Variable | Default | Meaning |
@@ -110,6 +122,16 @@ Runs until you quit, with no quality pass.
 scripts/run_comparison.sh video.mkv shaders/a.glsl shaders/b.glsl
 ```
 
+The second shader is optional. Leaving it out runs the other instance with no
+shader, which measures a custom shader against mpv's default scaler.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FRAMEWIRE_VO` | `gpu-next` | mpv video output |
+| `LABEL_A`, `LABEL_B` | shader file names | panel labels |
+| `DURATION` | unset | stop after this many seconds and print the report |
+| `BUILD_DIR` | `build` | where the binaries are |
+
 ### Quality only
 
 Takes any number of configs, unlike the cost pass which compares two.
@@ -127,11 +149,18 @@ scripts/quality.py \
 ### Without a GPU
 
 A mock mpv server drives the whole pipeline headless, so the dashboard can be
-seen with no GPU, no display and no video file.
+seen with no GPU, no display and no video file. It is also what the
+`end_to_end` test uses, since a machine building this project will not have any
+of those.
 
 ```sh
 scripts/demo.sh 30
 ```
+
+The mock is strict about argument types, because an earlier permissive version
+answered every command with success and hid a bug that left the real tool
+capturing nothing. A mock is never allowed to be the only thing exercising a
+protocol path.
 
 ### Ring benchmark
 
@@ -140,35 +169,47 @@ scripts/bench.sh
 build/framewire-stress --records 20000000 --capacity 4096
 ```
 
-### Starting the pieces by hand
+### Running the pieces by hand
 
 Each binary runs on its own, which is handy when attaching to an mpv instance
 that is already playing.
 
 ```sh
+# one producer per player
+build/framewire-producer --socket /tmp/mpv-a.sock --shm /framewire-a --label espcn
+build/framewire-producer --socket /tmp/mpv-b.sock --shm /framewire-b --label baseline
+
+# the dashboard
+build/framewire --shm-a /framewire-a --shm-b /framewire-b
+```
 
 ## Reading the output
 
 ```
- framewire  live  00:00:03  paired 262
- espcn-x2                       live      espcn-heavy                    live
- ─────────────────────────────────────    ─────────────────────────────────────
- gpu    now 4.19ms  p50 2.88ms  p99 ...  gpu    now 5.83ms  p50 3.40ms  p99 ...
- frame  now 41.14ms p50 41.66ms p99 ...  frame  now 41.63ms p50 41.67ms p99 ...
- life   p50 2.88ms  p99 4.29ms  max ...  life   p50 3.40ms  p99 6.65ms  max ...
- fps    24.0 now  24.0 avg  frames 202  fps    23.9 now  23.9 avg  frames 201
- dropped 4 (1.53%)  delayed 2            dropped 3 (1.15%)  delayed 1
- ring   pend 0  lost 0  crc 0  gaps 0    ring   pend 0  lost 0  crc 0  gaps 0
- ▃▅▃▅▂▅▃▅▄▃▅▅▅▃▄▄▄▆▅▅▁▅▃▄▅▄▆▇▃▄▂▅▆▃█▅    ▁▂█▃▃▃▂▂▅▄▄▄▄▄▄▂▂▆▁▃▃▁▄▆▂▁▄▄▄▅▂▂▄▂▄▅
+ framewire  live  00:00:06  paired 174
 
- passes                                  passes
-  espcn conv1 relu       634.9us 1.08ms    espcn conv1 relu      1.16ms 2.40ms
-  ...                                      ...
+espcn_x2_8 live                                             ewa_lanczossharp live
+──────────────────────────────────────────────────────────  ──────────────────────────────────────────────────────────
+gpu    now 1.25ms   p50 749.7us  p99 1.34ms   p999 1.77ms   gpu    now 1.44ms   p50 873.2us  p99 3.92ms   p999 3.92ms
+frame  now 45.28ms  p50 41.81ms  p99 83.90ms  p999 84.13ms  frame  now 41.75ms  p50 41.82ms  p99 86.53ms  p999 125.95m
+life   p50 750.6us  p99 1.34ms   max  1.77ms                life   p50 873.5us  p99 3.92ms   max  3.92ms
+fps    23.7 now  23.7 avg   frames 177                      fps    23.9 now  23.9 avg   frames 179
+dropped 0 (0.00%)  delayed 0                                dropped 0 (0.00%)  delayed 0
+ring   pend 0     lost 0     crc 0 gaps 0                   ring   pend 0     lost 0     crc 0 gaps 0
+▁▁▁▁▁▁▂▂▂▁▁▂▂▂▁▁▂▁▁▁█▂▂▂▂▂▂▂▂▂▂▄▂▂▃▃▂▂▂▃▂▂▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃  ▅▁██▁▁▇▁▁▁▄▁▁▆▄▁▁▁▁▁▁▃██▁▁▁▁▁▁▇▇▁▅▄▁▂▁▂▂▂▁▅▂▂▂▂▆█▂▂▂▂▂▇▂▇▂
 
- comparison  b minus a  ──────────────────────────────────────────────────────
- gpu delta   p50 +1.81ms   p99 +3.12ms   mean +1.82ms
- faster      espcn-x2 on 100.0% of paired frames   speedup 0.461x
- unmatched   a 0   b 0
+passes                                                      passes
+ espcn_x2_8 conv1 (5x5, 1->8) 107.6us  186.3us               color decoding               49.9us   116.4us
+ espcn_x2_8 conv1 (5x5, 1->8) 104.8us  175.7us               polar upscaling (ewa_lanczos 823.6us  3.86ms
+ espcn_x2_8 conv2 (3x3, 8->8) 82.1us   137.4us
+ espcn_x2_8 conv2 (3x3, 8->8) 79.1us   131.6us
+ espcn_x2_8 conv3 + pixel shu 303.9us  507.6us
+ color decoding, color encodi 72.1us   262.2us
+
+ comparison  b minus a  ─────────────────────────────────────────────────────────────────────────────────────────────
+ gpu delta   p50 +97.8us    p99 +2.81ms    mean +324.3us
+ faster      espcn_x2_8 on 97.1% of paired frames   speedup 0.859x
+ unmatched   a 3   b 3
 ```
 
 Row by row:
@@ -209,7 +250,12 @@ each stream and refuses to present mismatched captures as like for like. See
 
 ## Testing
 
-Four unit suites and a stress test, all wired into CTest:
+```sh
+cd build && ctest --output-on-failure
+```
+
+Four unit suites, a headless end to end run and a stress smoke test, all wired
+into CTest. Everything here runs without a GPU, a display or a video file:
 
 | Suite | Covers |
 | --- | --- |
