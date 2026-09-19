@@ -1,0 +1,407 @@
+# framewire
+
+A lock free telemetry comparison tool for two `mpv` instances rendering the
+same video with different GPU shaders.
+
+framewire launches two players, captures per frame GPU render timings from each
+over mpv's JSON IPC socket, moves those timings through a shared memory SPSC
+ring buffer per instance, and aggregates both streams in a separate process
+that computes comparative latency statistics and draws a live terminal
+dashboard.
+
+The tool was built to answer one question with real numbers rather than
+impressions: does a custom GLSL ESPCN upscaler actually cost less GPU time than
+the built in scaler, and where does the difference land in the pass breakdown.
+
+```
+  mpv instance A                    mpv instance B
+  --input-ipc-server=/tmp/a.sock    --input-ipc-server=/tmp/b.sock
+        |  vo-passes JSON                 |  vo-passes JSON
+        v                                 v
+  framewire-producer                framewire-producer
+        |  lock free push                 |  lock free push
+        v                                 v
+  /dev/shm/framewire-a              /dev/shm/framewire-b
+        |                                 |
+        +---------------+-----------------+
+                        v
+                    framewire
+          correlate by monotonic timestamp
+          p50 / p99 / p999, per pass deltas
+                        v
+                 terminal dashboard
+```
+
+## Build
+
+Requires a C++20 compiler and CMake 3.16 or newer. Nothing else.
+
+```sh
+cmake -S . -B build -G Ninja
+cmake --build build -j
+```
+
+Run the tests:
+
+```sh
+cd build && ctest --output-on-failure
+```
+
+To build with the strict warning set treated as errors, which is how the code
+is kept clean:
+
+```sh
+cmake -S . -B build -G Ninja -DFRAMEWIRE_WERROR=ON
+```
+
+## Running a comparison
+
+### With real mpv
+
+mpv only fills in the `vo-passes` property for the GPU video outputs, so
+`--vo=gpu` or `--vo=gpu-next` is required. The helper script starts both
+players, both producers and the dashboard, and cleans everything up on exit.
+
+```sh
+scripts/run_comparison.sh video.mkv shaders/espcn.glsl
+```
+
+The second shader argument is optional. Leaving the argument out runs the
+second instance with no shader, which makes the comparison measure the custom
+shader against mpv's default scaler.
+
+```sh
+scripts/run_comparison.sh video.mkv shaders/espcn.glsl shaders/other.glsl
+```
+
+Useful environment variables:
+
+| Variable | Meaning |
+| --- | --- |
+| `FRAMEWIRE_VO` | mpv video output, defaults to `gpu-next` |
+| `LABEL_A`, `LABEL_B` | panel labels, default to the shader file names |
+| `DURATION` | stop after this many seconds and print the report |
+| `BUILD_DIR` | where the binaries live, defaults to `build` |
+
+### Without a GPU
+
+A mock mpv server ships with the project and speaks enough of the IPC protocol
+to drive the whole pipeline. The mock is how the dashboard and the correlator
+get tested, and the mock is useful for seeing the view without a video file.
+
+```sh
+scripts/demo.sh 30
+```
+
+### Starting the pieces by hand
+
+Each binary runs on its own, which is handy when attaching to an mpv instance
+that is already playing.
+
+```sh
+# one producer per player
+build/framewire-producer --socket /tmp/mpv-a.sock --shm /framewire-a --label espcn
+build/framewire-producer --socket /tmp/mpv-b.sock --shm /framewire-b --label baseline
+
+# the dashboard
+build/framewire --shm-a /framewire-a --shm-b /framewire-b
+```
+
+## Reading the dashboard
+
+```
+ framewire  live  00:00:03  paired 262
+ espcn-x2                       live      espcn-heavy                    live
+ ─────────────────────────────────────    ─────────────────────────────────────
+ gpu    p50 1.56ms  p99 2.14ms  p999 ...  gpu    p50 3.37ms  p99 4.63ms  p999 ...
+ frame  p50 16.67ms p99 16.92ms p999 ...  frame  p50 16.67ms p99 16.95ms p999 ...
+ life   p50 1.56ms  p99 2.14ms  max  ...  life   p50 3.38ms  p99 4.63ms  max  ...
+ fps    60.0    frames 262               fps    60.0    frames 262
+ dropped 4 (1.53%)  delayed 2            dropped 3 (1.15%)  delayed 1
+ ring   pend 0  lost 0  crc 0  gaps 0    ring   pend 0  lost 0  crc 0  gaps 0
+ ▃▅▃▅▂▅▃▅▄▃▅▅▅▃▄▄▄▆▅▅▁▅▃▄▅▄▆▇▃▄▂▅▆▃█▅    ▁▂█▃▃▃▂▂▅▄▄▄▄▄▄▂▂▆▁▃▃▁▄▆▂▁▄▄▄▅▂▂▄▂▄▅
+
+ passes                                  passes
+  espcn conv1 relu       634.9us 1.08ms    espcn conv1 relu      1.16ms 2.40ms
+  ...                                      ...
+
+ comparison  b minus a  ──────────────────────────────────────────────────────
+ gpu delta   p50 +1.81ms   p99 +3.12ms   mean +1.82ms
+ faster      espcn-x2 on 100.0% of paired frames   speedup 0.461x
+ unmatched   a 0   b 0
+```
+
+Row by row:
+
+- **gpu** is total GPU time for the frame, summed across every shader pass, over
+  a sliding window of the last few thousand frames.
+- **frame** is the wall clock gap between consecutive frames, so a steady 60 fps
+  player sits at 16.67ms.
+- **life** is the same GPU statistic over the whole run instead of the recent
+  window. A gap between the two rows means the workload is changing.
+- **dropped** and **delayed** come from mpv's `frame-drop-count` and
+  `vo-delayed-frame-count`.
+- **ring** is transport health, and is the row that says whether the numbers
+  above can be trusted. `pend` is records waiting in the ring, `lost` is records
+  the producer could not fit because the dashboard fell behind, `crc` is failed
+  checksums, and `gaps` is breaks in the sequence numbering. In a healthy run
+  `lost`, `crc` and `gaps` are all zero, and the row turns red when a value is
+  not.
+- The sparkline shows recent total GPU time, scaled to the visible range.
+- **comparison** is computed only from frames that were paired across both
+  streams, so the two sides are always compared on equal footing.
+
+Keys: `q` quits, `p` pauses accumulation, `r` resets every statistic.
+
+When stdout is not a terminal the live view is skipped and a plain text report
+is printed at exit instead, which is what makes the tool usable in a script.
+`--report PATH` writes that report to a file as well.
+
+## Design notes
+
+### The ring buffer
+
+One producer and one consumer, a power of two slot count, and 64 bit indices
+that only ever increase. Indices are masked to find a slot, and at a thousand
+frames a second a 64 bit counter takes longer than the age of the universe to
+wrap, so wraparound is not handled and does not need to be.
+
+`head` and `tail` each get a private cache line. Putting both on one line is
+the classic false sharing bug in this kind of queue and costs a coherence miss
+on every push. The layout is checked by `static_assert` rather than trusted,
+because losing the padding would not break the queue, it would only make the
+queue quietly much slower.
+
+The cached copies of the far index live in the handle objects, in memory
+private to each process, and deliberately not in the shared header. A cached
+value is written often and read by one side only, so parking the value in
+shared memory would drag the other side's cache line back and forth and undo
+the padding.
+
+Memory ordering is acquire and release, never sequentially consistent. Every
+atomic operation carries a comment explaining the choice, but the short version
+is:
+
+| Operation | Ordering | Why |
+| --- | --- | --- |
+| producer loads `head` | relaxed | the producer is the only writer, nothing is published by reading |
+| producer loads `tail` | acquire | pairs with the consumer's release, proves the consumer finished reading a slot before that slot is reused |
+| producer stores `head` | release | publishes the record bytes written just before, a relaxed store here is the bug that lets a consumer see the index move while the record is still in flight |
+| consumer loads `tail` | relaxed | the consumer is the only writer |
+| consumer loads `head` | acquire | pairs with the producer's release, makes the record bytes visible |
+| consumer stores `tail` | release | keeps the record copy from sinking past the index bump |
+
+Sequential consistency would work and would be easier to argue about, but it
+forces a full barrier on x86 stores for a guarantee this queue never needs.
+There is no total order requirement across the two indices, only the pairwise
+happens before relationship between one side's store and the other side's load.
+
+When the ring is full the producer drops the newest record and counts the drop.
+Overwriting the oldest unread slot would race with a consumer that is mid copy,
+and would also bias the latency statistics toward recent frames. Dropping and
+counting is the honest choice for telemetry, and the count is visible on the
+dashboard so a reader always knows when a number is incomplete.
+
+### Records
+
+`TelemetryRecord` is exactly 128 bytes, trivially copyable, and made only of
+fixed width integers with no pointers, because the struct lives in memory that
+each process maps at a different address. The size is pinned by `static_assert`
+and is part of the shared memory ABI, which the header version guards.
+
+The checksum is the last field on purpose, so the covered range is every other
+byte of the record. A torn read anywhere is then caught, which is the property
+the stress harness relies on.
+
+Pass names are not stored in the record. Names are stable for the life of a
+shader chain, so the names live once in the ring header behind a version
+counter and `pass_ns` is indexed against that directory. The producer publishes
+the directory with a release store and only when the chain actually changes.
+
+### Quantiles
+
+Two structures, for two different questions.
+
+Lifetime percentiles use a histogram laid out the way HdrHistogram does it:
+buckets by exponent, with a fixed number of linear slots inside each exponent.
+Storage is constant at about 112 KB, relative error stays under 0.1 percent
+across the whole range, and recording a sample is a few shifts and an
+increment. Keeping every sample and sorting would be exact, but a long
+benchmark run would end up holding millions of samples just to read three
+numbers off the tail.
+
+Recent percentiles use a bounded ring of raw samples, sorted on demand. A
+histogram cannot forget old samples, and the dashboard needs to show what the
+last few seconds look like. Sorting a few thousand values ten times a second
+costs nothing and is exact.
+
+### Correlating the two streams
+
+The two players are never frame locked, so the streams drift against each
+other. Matching is a merge over both queues, and the decision only ever needs
+the front record of each side. If the earlier record is outside the tolerance
+window of the other side's front, no future record can be closer, so the record
+retires as unmatched rather than being paired with something unrelated. The
+default window is 8ms, about half a frame at 60 fps.
+
+Every comparative number comes from paired frames only. Comparing the two
+independent averages would be misleading, because the two instances can render
+a different number of frames over the same wall time.
+
+Per pass differences are only reported when both chains have the same pass
+count. Lining up pass three of a five pass chain against pass three of a three
+pass chain would produce a confident looking number that means nothing.
+
+### The terminal
+
+Raw ANSI, not a TUI library. Two reasons. The dependency list stays empty,
+which matters for a tool meant to measure something, since every library linked
+in is more code running next to the thing under test. And a dashboard row
+changes as a unit, so a row level diff is the natural granularity: rows are held
+as fully formatted strings, compared whole, and only the rows that changed are
+written. A refresh where nothing moved costs zero bytes on the wire.
+
+The terminal is put back the way it was found on exit, including after a
+signal, so a crash never leaves a shell without echo.
+
+## Dependencies
+
+None beyond the C++20 standard library and POSIX.
+
+The prompt allowed dependencies for JSON parsing and the terminal UI. Both were
+dropped after looking at what each would actually buy:
+
+- **JSON.** The mpv IPC schema is small and fixed. A few hundred lines of
+  recursive descent covers the protocol, parses into a flat node array with no
+  per node allocation, and reuses the buffers across messages so a steady
+  stream of frames settles into zero allocations. A general purpose library
+  would add a large header for features this program never uses. The parser is
+  strict about the JSON grammar, including rejecting leading zeros, and has a
+  depth cap so a corrupt message produces a parse error instead of a blown
+  stack.
+- **Terminal UI.** See the section above. ncurses would bring a dependency, a
+  global screen model and its own input handling, in exchange for a cell level
+  diff this layout does not need.
+
+`librt` is linked only when `shm_open` is found there, since the symbol moved
+into libc on newer glibc.
+
+## Benchmarks
+
+Measured on an Intel Core i9-13900H, Linux 7.2.5, gcc 16.2.1, release build.
+
+### Ring buffer throughput
+
+Produced by `scripts/bench.sh`. Each run pushes 20 million records through the
+ring between two separate forked processes, not threads, so the shared memory
+path is what gets exercised. Every record is verified on the way out against a
+payload rebuilt from the sequence number, so a torn read that mixed bytes from
+two records would be caught even if both halves were individually valid.
+
+| Ring slots | M records/s | MiB/s | ns per record | Integrity |
+| --- | --- | --- | --- | --- |
+| 256 | 4.35 | 530.8 | 230.0 | pass |
+| 1024 | 4.26 | 520.1 | 234.7 | pass |
+| 4096 | 5.00 | 610.1 | 200.1 | pass |
+| 16384 | 4.66 | 569.2 | 214.5 | pass |
+| 65536 | 4.98 | 608.2 | 200.7 | pass |
+
+Across all five runs, 100 million records total: zero checksum errors, zero
+payload mismatches, zero ordering faults, zero missing records.
+
+The record is 128 bytes, so a single ring sustains a rate several thousand
+times higher than the roughly 60 to 240 records a second a real player
+produces. The transport is not the bottleneck and was never going to be. The
+point of measuring is to show the headroom is large enough that the
+instrumentation cannot distort what is being instrumented.
+
+Throughput is flat across ring sizes because the queue is not the limiting
+factor at these rates. The consumer side verification dominates, which is the
+intended trade for an integrity harness.
+
+### End to end
+
+The full pipeline against the mock server, two players and two producers
+feeding one dashboard, 30 seconds at 60 fps per stream:
+
+| Measure | Value |
+| --- | --- |
+| Frames captured per stream | 1819 |
+| Frames paired across streams | 1819 |
+| Unmatched frames | 0 |
+| Records lost to a full ring | 0 |
+| Checksum errors | 0 |
+| Sequence gaps | 0 |
+| Producer CPU | 0.10% of one core |
+| Consumer CPU, dashboard at 10 Hz | 0.97% of one core |
+
+Pushing both streams to 240 fps raises the producer to 0.55% of a core and the
+consumer to 1.55%. The producer cost is what matters, since that process is the
+one sharing a machine with the players being measured.
+
+### A note on the shader numbers
+
+The per shader timings in this README come from the mock mpv server, whose pass
+timings are synthetic and shaped to resemble a real GPU shader chain. The
+numbers demonstrate the tool, not a real ESPCN result. Running
+`scripts/run_comparison.sh` against a real video on a real GPU is what produces
+real numbers, and the report format is identical either way.
+
+## Testing
+
+Four unit suites and a stress test, all wired into CTest:
+
+| Suite | Covers |
+| --- | --- |
+| `ring` | ordering, wraparound, the full ring policy, batch pop across the array end, the pass directory, producer liveness, a threaded handoff of 200000 records |
+| `json` | scalars, escapes and surrogate pairs, containers, 22 malformed inputs, depth limits, real mpv message shapes, writer round trip |
+| `histogram` | quantile accuracy against an exact sorted reference, the bucket zero linear range, clamping past the ceiling, merging, both sliding windows |
+| `stats` | frame pairing, unmatched retirement, flushing, per pass gating, corrupt record handling, sequence gap counting, duration formatting |
+| `stress_smoke` | a short two process run of the full stress harness |
+
+The stress harness is the real test of the ring. Run a longer one directly:
+
+```sh
+build/framewire-stress --records 20000000 --capacity 4096
+```
+
+Options exist to stall either side on purpose (`--slow-consumer`,
+`--slow-producer`) to exercise the backpressure path.
+
+Three bugs were found by this suite during the build and are worth naming,
+since all three were silent:
+
+1. The histogram computed its bucket zero index with unsigned arithmetic, so
+   every sample below 512 wrapped and landed in the top bucket. p999 came back
+   as 68 seconds instead of 99900 ns. Caught by comparing against an exact
+   sorted reference.
+2. The JSON number scanner accepted `01`, because `from_chars` accepts a
+   leading zero even though the JSON grammar does not.
+3. The stress harness producer never sent a heartbeat during its push loop, so
+   the consumer decided the producer had died and exited early on any run
+   longer than the staleness window. The producer then spun forever on a full
+   ring. Only visible on runs past two seconds, which is why a short smoke test
+   never saw it.
+
+## Platform
+
+Linux and POSIX only, as specified. Windows support is not built, but the
+platform specific calls are confined to three files (`src/shm.cpp`,
+`src/ipc_client.cpp`, `src/term.cpp`), so an abstraction layer has a clear seam
+to sit on. Everything else is portable C++.
+
+## Layout
+
+```
+include/framewire/    public headers
+src/                  library sources and the four binaries
+tests/                unit suites
+scripts/              run_comparison.sh, demo.sh, bench.sh
+```
+
+| Binary | Role |
+| --- | --- |
+| `framewire` | consumer, correlator and dashboard |
+| `framewire-producer` | one per mpv instance, IPC to ring |
+| `framewire-stress` | two process ring stress harness |
+| `framewire-mock-mpv` | fake mpv for testing without a GPU |
