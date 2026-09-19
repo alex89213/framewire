@@ -109,21 +109,38 @@ Tunable through the environment:
 | `CLIP_LENGTH` | 12 | clip length in seconds |
 | `COST_SECONDS` | 20 | how long the live pass runs |
 | `QUALITY_FRAMES` | 12 | frames scored per config |
+| `SCALE` | 2 | upscale factor the shaders provide |
 | `BUILD_DIR` | `build` | where the binaries are |
 
 Clips are cached in `testclips/` and reused. Delete that directory to re-cut
 from a different scene.
 
-### Cost only, live dashboard
+### Cost only, any number of upscalers
 
-Runs until you quit, with no quality pass.
+The cost pass compares as many configurations as you give it. The first is the
+baseline every other one is reported against.
 
 ```sh
-scripts/run_comparison.sh video.mkv shaders/a.glsl shaders/b.glsl
+scripts/run_comparison.sh clip.mkv \
+  builtin:ewa_lanczossharp \
+  shader:espcn_x2_8.glsl \
+  shader:FSRCNNX_x2_8.glsl \
+  builtin:bilinear
 ```
 
-The second shader is optional. Leaving it out runs the other instance with no
-shader, which measures a custom shader against mpv's default scaler.
+```
+  stream                 gpu p50     delta       delta 95% interval       cheaper on            speedup
+  ewa_lanczossharp       726.2us     baseline    -                        -                     1.000x
+  espcn_x2_8             648.7us     -47.1us     [-60.3us, -26.3us]       92.0% [87.8, 94.8]    1.119x
+  FSRCNNX_x2_8-0-4-1     1.10ms      +364.2us    [+346.9us, +384.1us]     0.4% [0.1, 2.4]       0.661x
+  bilinear               63.6us      -630.2us    [-639.2us, -566.0us]     100.0% [98.4, 100.0]  11.427x
+
+  espcn_x2_8: cheaper than ewa_lanczossharp, and the whole interval agrees
+```
+
+Two streams get the side by side panel view with the full pass breakdown. More
+than two get a row each, since panels stop fitting once there is a ranking to
+read.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -243,7 +260,16 @@ When stdout is not a terminal the live view is skipped and a plain text report
 is printed at exit instead, which is what makes the tool usable in a script.
 `--report PATH` writes that report to a file as well.
 
-A comparison is only meaningful when both streams were captured under the same
+Every difference carries a 95% interval. A point estimate on its own invites a
+reader to treat noise as a result, so the report states plainly whether an
+interval clears zero:
+
+```
+  espcn_x2_8: cheaper than ewa_lanczossharp, and the whole interval agrees
+  some_other: no separation from ewa_lanczossharp, the interval crosses zero
+```
+
+A comparison is only meaningful when every stream was captured under the same
 conditions. framewire records the renderer, decode path and render size for
 each stream and refuses to present mismatched captures as like for like. See
 [docs/measurement.md](docs/measurement.md).
@@ -254,6 +280,11 @@ each stream and refuses to present mismatched captures as like for like. See
 cd build && ctest --output-on-failure
 ```
 
+CI runs the same suite on gcc and clang in Debug and Release, plus the address,
+thread and undefined behaviour sanitizers. The thread sanitizer earns its place
+more than anywhere else here, since a lock free queue is exactly the kind of
+code where a race shows up under load and never in a unit test.
+
 Four unit suites, a headless end to end run and a stress smoke test, all wired
 into CTest. Everything here runs without a GPU, a display or a video file:
 
@@ -262,7 +293,7 @@ into CTest. Everything here runs without a GPU, a display or a video file:
 | `ring` | ordering, wraparound, the full ring policy, batch pop across the array end, the pass directory, producer liveness, a threaded handoff of 200000 records |
 | `json` | scalars, escapes and surrogate pairs, containers, 22 malformed inputs, depth limits, real mpv message shapes, writer round trip |
 | `histogram` | quantile accuracy against an exact sorted reference, the bucket zero linear range, clamping past the ceiling, merging, both sliding windows |
-| `stats` | frame pairing, unmatched retirement, flushing, per pass gating, corrupt record handling, sequence gap counting, duration formatting |
+| `stats` | frame grouping across two and four streams, unmatched retirement, per pass gating, confidence intervals including that a noisy tie is not called significant, environment mismatch, corrupt records |
 | `end_to_end` | mock mpv through both producers, the rings, the aggregator and the report, checked for lossless capture and a correct verdict |
 | `stress_smoke` | a short two process run of the full stress harness |
 

@@ -28,10 +28,9 @@ using namespace framewire;
 constexpr size_t kPumpBatch = 4096;
 
 struct Options {
-  std::string shm_a = "/framewire-a";
-  std::string shm_b = "/framewire-b";
-  std::string label_a;
-  std::string label_b;
+  // baseline first, every other stream is reported against it
+  std::vector<std::string> shm_names;
+  std::vector<std::string> labels;
   std::string report_path;
   std::string json_path;
   double refresh_hz = 10.0;
@@ -46,10 +45,11 @@ void PrintUsage() {
   std::fprintf(stderr,
                "usage: framewire [options]\n"
                "\n"
-               "  --shm-a NAME      first ring name (default /framewire-a)\n"
-               "  --shm-b NAME      second ring name (default /framewire-b)\n"
-               "  --label-a TEXT    override the label stored by the producer\n"
-               "  --label-b TEXT    override the label stored by the producer\n"
+               "  --shm NAME        ring to read, repeat for each stream, first is\n"
+               "                    the baseline every other stream is compared to\n"
+               "  --label TEXT      override the label for the matching --shm\n"
+               "  --shm-a, --shm-b  aliases for the first two --shm arguments\n"
+               "  --label-a, --label-b  aliases for the first two --label arguments\n"
                "  --refresh HZ      dashboard refresh rate (default 10)\n"
                "  --tolerance MS    frame pairing window (default 8)\n"
                "  --duration S      stop after S seconds, then print the report\n"
@@ -71,22 +71,27 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
       return argv[++i];
     };
 
-    if (arg == "--shm-a") {
-      const char* v = next("--shm-a");
+    auto place = [](std::vector<std::string>* into, size_t index, const char* value) {
+      if (into->size() <= index) into->resize(index + 1);
+      (*into)[index] = value;
+    };
+
+    if (arg == "--shm") {
+      const char* v = next("--shm");
       if (!v) return false;
-      opt->shm_a = v;
-    } else if (arg == "--shm-b") {
-      const char* v = next("--shm-b");
+      opt->shm_names.emplace_back(v);
+    } else if (arg == "--label") {
+      const char* v = next("--label");
       if (!v) return false;
-      opt->shm_b = v;
-    } else if (arg == "--label-a") {
-      const char* v = next("--label-a");
+      opt->labels.emplace_back(v);
+    } else if (arg == "--shm-a" || arg == "--shm-b") {
+      const char* v = next(arg.c_str());
       if (!v) return false;
-      opt->label_a = v;
-    } else if (arg == "--label-b") {
-      const char* v = next("--label-b");
+      place(&opt->shm_names, arg == "--shm-a" ? 0 : 1, v);
+    } else if (arg == "--label-a" || arg == "--label-b") {
+      const char* v = next(arg.c_str());
       if (!v) return false;
-      opt->label_b = v;
+      place(&opt->labels, arg == "--label-a" ? 0 : 1, v);
     } else if (arg == "--refresh") {
       const char* v = next("--refresh");
       if (!v) return false;
@@ -124,6 +129,14 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
       return false;
     }
   }
+
+  if (opt->shm_names.empty()) {
+    opt->shm_names = {"/framewire-a", "/framewire-b"};
+  }
+  if (opt->shm_names.size() < 2) {
+    std::fprintf(stderr, "at least two rings are needed to compare anything\n");
+    return false;
+  }
   return true;
 }
 
@@ -155,37 +168,37 @@ RingMapping OpenWithRetry(const std::string& name, int timeout_ms) {
   }
 }
 
-std::string LabelFor(const RingMapping& m, const std::string& override_label,
-                     const char* fallback) {
-  if (!override_label.empty()) return override_label;
-  const std::string stored = m.header()->label;
-  return stored.empty() ? fallback : stored;
-}
-
 int Run(const Options& opt) {
   Terminal::InstallSignalHandlers();
 
   // two consumers on one ring would each take a share of the records and
   // neither would see the full stream, which breaks the single consumer rule
   // the whole queue is built on
-  if (opt.shm_a == opt.shm_b) {
-    throw std::runtime_error("--shm-a and --shm-b must name different rings, both are '" +
-                             opt.shm_a + "'");
+  for (size_t i = 0; i < opt.shm_names.size(); ++i) {
+    for (size_t j = i + 1; j < opt.shm_names.size(); ++j) {
+      if (opt.shm_names[i] == opt.shm_names[j]) {
+        throw std::runtime_error("--shm was given '" + opt.shm_names[i] +
+                                 "' more than once, each stream needs its own ring");
+      }
+    }
   }
 
-  std::fprintf(stderr, "framewire: waiting for rings %s and %s\n", opt.shm_a.c_str(),
-               opt.shm_b.c_str());
+  std::fprintf(stderr, "framewire: waiting for %zu rings\n", opt.shm_names.size());
 
-  RingMapping map_a = OpenWithRetry(opt.shm_a, opt.wait_ms);
-  RingMapping map_b = OpenWithRetry(opt.shm_b, opt.wait_ms);
+  std::vector<StreamAggregator> aggregators;
+  aggregators.reserve(opt.shm_names.size());
 
-  const std::string label_a = LabelFor(map_a, opt.label_a, "stream a");
-  const std::string label_b = LabelFor(map_b, opt.label_b, "stream b");
+  for (size_t i = 0; i < opt.shm_names.size(); ++i) {
+    RingMapping mapping = OpenWithRetry(opt.shm_names[i], opt.wait_ms);
+    std::string label = i < opt.labels.size() ? opt.labels[i] : std::string();
+    if (label.empty()) {
+      const std::string stored = mapping.header()->label;
+      label = stored.empty() ? ("stream " + std::to_string(i)) : stored;
+    }
+    aggregators.emplace_back(label, RingConsumer(std::move(mapping)));
+  }
 
-  StreamAggregator agg_a(label_a, RingConsumer(std::move(map_a)));
-  StreamAggregator agg_b(label_b, RingConsumer(std::move(map_b)));
-
-  Correlator correlator(static_cast<uint64_t>(opt.tolerance_ms * 1e6));
+  Correlator correlator(aggregators.size(), static_cast<uint64_t>(opt.tolerance_ms * 1e6));
 
   Terminal terminal;
   Screen screen;
@@ -198,25 +211,21 @@ int Run(const Options& opt) {
   const double refresh_hz = opt.refresh_hz > 0.1 ? opt.refresh_hz : 0.1;
   const auto refresh_ns = static_cast<uint64_t>(1e9 / refresh_hz);
   uint64_t next_refresh = start;
-  bool both_gone_reported = false;
+  bool all_gone_reported = false;
 
-  std::vector<TelemetryRecord> batch_a;
-  std::vector<TelemetryRecord> batch_b;
-
-  StreamSnapshot snap_a;
-  StreamSnapshot snap_b;
+  std::vector<std::vector<TelemetryRecord>> batches(aggregators.size());
+  std::vector<StreamSnapshot> snaps(aggregators.size());
   ComparisonSnapshot snap_cmp;
 
   while (!Terminal::ShutdownRequested()) {
-    batch_a.clear();
-    batch_b.clear();
-
-    const size_t read_a = agg_a.Pump(kPumpBatch, &batch_a);
-    const size_t read_b = agg_b.Pump(kPumpBatch, &batch_b);
+    size_t read_total = 0;
+    for (size_t i = 0; i < aggregators.size(); ++i) {
+      batches[i].clear();
+      read_total += aggregators[i].Pump(kPumpBatch, &batches[i]);
+    }
 
     if (!state.paused) {
-      correlator.PushA(batch_a);
-      correlator.PushB(batch_b);
+      for (size_t i = 0; i < aggregators.size(); ++i) correlator.Push(i, batches[i]);
       correlator.Process();
     }
 
@@ -232,16 +241,19 @@ int Run(const Options& opt) {
       next_refresh = now + refresh_ns;
       ++state.refreshes;
 
-      snap_a = agg_a.Snapshot();
-      snap_b = agg_b.Snapshot();
-      snap_cmp = correlator.Snapshot(snap_a, snap_b);
+      for (size_t i = 0; i < aggregators.size(); ++i) snaps[i] = aggregators[i].Snapshot();
+      snap_cmp = correlator.Snapshot(snaps);
 
-      // once both producers are gone there is nothing left to draw, so drain
-      // whatever is queued and stop rather than spinning on a dead ring
-      if (!snap_a.producer_alive && !snap_b.producer_alive) {
-        if (both_gone_reported) break;
-        both_gone_reported = true;
-        state.status = "both producers finished, press q to exit";
+      // once every producer is gone there is nothing left to draw, so drain
+      // whatever is queued and stop rather than spinning on dead rings
+      bool any_alive = false;
+      for (const auto& s : snaps) {
+        if (s.producer_alive) any_alive = true;
+      }
+      if (!any_alive) {
+        if (all_gone_reported) break;
+        all_gone_reported = true;
+        state.status = "every producer finished, press q to exit";
       }
 
       if (interactive) {
@@ -251,7 +263,7 @@ int Run(const Options& opt) {
         if (Terminal::TakeResizeFlag()) screen.Invalidate();
 
         screen.BeginFrame(width, height);
-        RenderDashboard(screen, snap_a, snap_b, snap_cmp, state);
+        RenderDashboard(screen, snaps, snap_cmp, state);
         screen.EndFrame();
       }
     }
@@ -264,43 +276,38 @@ int Run(const Options& opt) {
         state.status = state.paused ? "paused, p resumes" : "";
       }
       if (key == 'r' || key == 'R') {
-        agg_a.ResetStats();
-        agg_b.ResetStats();
+        for (auto& a : aggregators) a.ResetStats();
         correlator.Reset();
         state.status = "stats reset";
       }
     }
 
-    // nothing arrived from either ring, so give the cpu back instead of
-    // spinning. a busy poll would burn a core to no benefit at 60 frames a
-    // second, where a frame is 16 milliseconds apart
-    if (read_a == 0 && read_b == 0) {
+    // nothing arrived from any ring, so give the cpu back instead of spinning
+    if (read_total == 0) {
       const timespec nap{0, 2 * 1000 * 1000};
       nanosleep(&nap, nullptr);
     }
   }
 
   // one last drain so records already in the rings are counted
-  batch_a.clear();
-  batch_b.clear();
-  agg_a.Pump(kPumpBatch, &batch_a);
-  agg_b.Pump(kPumpBatch, &batch_b);
-  correlator.PushA(batch_a);
-  correlator.PushB(batch_b);
+  for (size_t i = 0; i < aggregators.size(); ++i) {
+    batches[i].clear();
+    aggregators[i].Pump(kPumpBatch, &batches[i]);
+    correlator.Push(i, batches[i]);
+  }
   correlator.Process(true);
 
-  snap_a = agg_a.Snapshot();
-  snap_b = agg_b.Snapshot();
-  snap_cmp = correlator.Snapshot(snap_a, snap_b);
+  for (size_t i = 0; i < aggregators.size(); ++i) snaps[i] = aggregators[i].Snapshot();
+  snap_cmp = correlator.Snapshot(snaps);
 
   terminal.Leave();
 
-  const std::string report =
-      BuildTextReport(snap_a, snap_b, snap_cmp, MonotonicNanos() - start);
+  const uint64_t elapsed = MonotonicNanos() - start;
+  const std::string report = BuildTextReport(snaps, snap_cmp, elapsed);
   std::fputs(report.c_str(), stdout);
 
   if (!opt.json_path.empty()) {
-    const std::string json = BuildJsonReport(snap_a, snap_b, snap_cmp, MonotonicNanos() - start);
+    const std::string json = BuildJsonReport(snaps, snap_cmp, elapsed);
     FILE* f = std::fopen(opt.json_path.c_str(), "w");
     if (f == nullptr) {
       std::fprintf(stderr, "framewire: could not write %s\n", opt.json_path.c_str());

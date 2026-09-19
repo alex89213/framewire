@@ -90,24 +90,46 @@ struct PassDelta {
 };
 
 /*
- * Comparative numbers derived only from frames that were matched across both
- * streams.
+ * One stream's standing in the comparison, measured against the baseline.
  *
- * Comparing the two independent averages would be misleading, because the
- * instances can render a different number of frames over the same wall time.
- * Every field here comes from paired samples.
+ * Every field here comes from grouped frames only, never from the stream's own
+ * lifetime statistics, so the streams are always compared on the same frames.
+ */
+struct StreamComparison {
+  std::string label;
+  uint64_t gpu_p50 = 0;           // over grouped frames only
+  int64_t delta_p50 = 0;          // this stream minus the baseline
+  double cheaper_fraction = 0.0;  // share of groups where this stream cost less
+  double speedup = 0.0;           // baseline p50 divided by this p50
+  bool is_baseline = false;
+
+  // 95% bounds on the two numbers above. a point estimate with no interval
+  // invites a reader to treat noise as a result, which is the failure this
+  // whole tool is built to avoid
+  int64_t delta_p50_low = 0;
+  int64_t delta_p50_high = 0;
+  double cheaper_low = 0.0;
+  double cheaper_high = 0.0;
+  bool interval_valid = false;
+
+  // true when the delta interval stays entirely on one side of zero
+  bool significant = false;
+};
+
+/*
+ * Comparative numbers derived only from frames matched across every stream.
+ *
+ * Comparing independent averages would be misleading, because the instances
+ * can render a different number of frames over the same wall time. A frame
+ * counts only when every stream has one close enough to it.
  */
 struct ComparisonSnapshot {
-  uint64_t paired = 0;
-  uint64_t unmatched_a = 0;
-  uint64_t unmatched_b = 0;
+  uint64_t grouped = 0;               // frames matched across all streams
+  std::vector<uint64_t> unmatched;    // per stream, retired without a partner
+  std::vector<StreamComparison> streams;
 
-  int64_t gpu_delta_p50 = 0;  // b minus a
-  int64_t gpu_delta_p99 = 0;
-  double gpu_delta_mean = 0.0;
-  double a_faster_fraction = 0.0;  // share of pairs where stream a used less gpu time
-  double speedup = 0.0;            // a p50 divided by b p50, above one means b is faster
-
+  // per pass differences only make sense between two chains of equal length,
+  // so these are populated for a two stream run and left empty otherwise
   std::vector<PassDelta> pass_deltas;
 };
 
@@ -169,13 +191,16 @@ class StreamAggregator {
 };
 
 /*
- * Pairs frames across the two streams and tracks the comparative statistics.
+ * Groups frames across any number of streams and tracks the comparison.
  *
- * The two mpv instances are never frame locked, so the streams drift against
- * each other. Matching is a merge over both queues: the earlier of the two
- * front records is either close enough to pair, or is old enough that no
- * future record from the other side could be closer, in which case the record
- * is retired as unmatched.
+ * The players are never frame locked, so the streams drift against each other.
+ * Matching is a merge over all queues and the decision only ever needs the
+ * front record of each: if the earliest and the latest front are further apart
+ * than the tolerance, the earliest can never be matched by anything still to
+ * come, so it retires unmatched. Otherwise every front is close enough and the
+ * whole group is emitted together.
+ *
+ * Stream zero is the baseline every other stream is reported against.
  */
 class Correlator {
  public:
@@ -183,27 +208,44 @@ class Correlator {
    * Builds a correlator.
    *
    * Args:
-   *   tolerance_ns: Largest timestamp gap that still counts as the same frame.
+   *   stream_count: Number of streams to group across, at least two.
+   *   tolerance_ns: Largest key gap that still counts as the same frame.
    */
-  explicit Correlator(uint64_t tolerance_ns);
-
-  void PushA(const std::vector<TelemetryRecord>& records);
-  void PushB(const std::vector<TelemetryRecord>& records);
+  Correlator(size_t stream_count, uint64_t tolerance_ns);
 
   /*
-   * Matches whatever can be decided from the queued records.
+   * Queues records for one stream.
    *
    * Args:
-   *   flush: Retire every remaining record, used once both producers finish.
+   *   stream: Stream index.
+   *   records: Records in arrival order.
+   */
+  void Push(size_t stream, const std::vector<TelemetryRecord>& records);
+
+  /*
+   * Groups whatever can be decided from the queued records.
+   *
+   * Args:
+   *   flush: Retire every remaining record, used once the producers finish.
    */
   void Process(bool flush = false);
 
-  ComparisonSnapshot Snapshot(const StreamSnapshot& a, const StreamSnapshot& b) const;
+  /*
+   * Builds the comparison.
+   *
+   * Args:
+   *   streams: Per stream snapshots, in the same order as the stream indices.
+   * Returns:
+   *   The comparison across grouped frames.
+   */
+  ComparisonSnapshot Snapshot(const std::vector<StreamSnapshot>& streams) const;
+
   void Reset();
 
+  size_t stream_count() const { return queues_.size(); }
+
   // Records held back waiting for a possible partner.
-  size_t PendingA() const { return queue_a_.size(); }
-  size_t PendingB() const { return queue_b_.size(); }
+  size_t Pending(size_t stream) const { return queues_[stream].size(); }
 
   // Pairing key for a record, media position when available.
   int64_t PairingKey(const TelemetryRecord& rec) const;
@@ -211,26 +253,30 @@ class Correlator {
   bool pairing_on_media_time() const { return use_media_time_; }
 
  private:
+  // Emits one group once every front has been confirmed close enough.
+  void EmitGroup();
+
   uint64_t tolerance_ns_;
 
-  // set once both sides have supplied a media position. mixing keys would be
-  // meaningless, so the choice is made from what both streams actually carry
+  // set once every stream has supplied a media position. mixing keys would be
+  // meaningless, so the choice is made from what the streams actually carry
   bool use_media_time_ = false;
-  bool media_seen_a_ = false;
-  bool media_seen_b_ = false;
+  std::vector<bool> media_seen_;
 
-  std::deque<TelemetryRecord> queue_a_;
-  std::deque<TelemetryRecord> queue_b_;
+  std::vector<std::deque<TelemetryRecord>> queues_;
 
-  SignedWindow gpu_delta_;
+  // deltas against stream zero, so index zero stays unused
+  std::vector<SignedWindow> gpu_delta_;
+  std::vector<SampleWindow> gpu_grouped_;
+  std::vector<uint64_t> cheaper_than_baseline_;
+  std::vector<uint64_t> unmatched_;
+
+  // pairwise pass detail, only kept for a two stream run
   std::vector<SignedWindow> pass_delta_;
   std::vector<SampleWindow> pass_a_;
   std::vector<SampleWindow> pass_b_;
 
-  uint64_t paired_ = 0;
-  uint64_t unmatched_a_ = 0;
-  uint64_t unmatched_b_ = 0;
-  uint64_t a_faster_ = 0;
+  uint64_t grouped_ = 0;
 };
 
 /*
@@ -262,6 +308,22 @@ std::string FormatSignedNanos(int64_t ns);
  *   The parsed pairs.
  */
 std::map<std::string, std::string> ParseEnvironment(const std::string& text);
+
+/*
+ * Computes a Wilson score interval for a proportion.
+ *
+ * The textbook normal interval misbehaves near zero and one, which is exactly
+ * where a shader comparison lands when one side wins almost every frame. Wilson
+ * stays inside the unit interval and is still a one line calculation.
+ *
+ * Args:
+ *   successes: Count of positive outcomes.
+ *   trials: Total count.
+ *   z: Standard normal quantile, 1.96 for 95%.
+ *   low: Receives the lower bound.
+ *   high: Receives the upper bound.
+ */
+void WilsonInterval(uint64_t successes, uint64_t trials, double z, double* low, double* high);
 
 /*
  * Lists the environment keys where two streams disagree.

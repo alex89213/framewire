@@ -174,6 +174,40 @@ def run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
+def video_size(path):
+    """
+    Reads the pixel dimensions of a video.
+
+    Args:
+        path: Video file.
+    Returns:
+        A tuple of width and height.
+    """
+    r = run(["ffprobe", "-v", "error", "-select_streams", "v",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0", path])
+    w, h = r.stdout.strip().split(",")[:2]
+    return int(w), int(h)
+
+
+def residual_scale(input_size, capture_size, scale):
+    """
+    Reports how far the shader output is from landing on the render target.
+
+    A shader that supplies exactly the ratio between the input clip and the
+    render area reaches the screen untouched. Anything else gets resampled on
+    the way, which blurs the very differences being measured.
+
+    Args:
+        input_size: Width and height of the input clip.
+        capture_size: Width and height of the capture.
+        scale: Upscale factor the shader provides.
+    Returns:
+        The leftover scale factor, 1.0 when nothing is resampled.
+    """
+    shader_out = input_size * scale
+    return capture_size / shader_out if shader_out else 0.0
+
+
 def probe_geometry(clip):
     """
     Opens one mpv window and reports the size the compositor actually gave it.
@@ -338,6 +372,8 @@ def main():
     ap.add_argument("--spec", action="append", default=[],
                     help="shader:PATH, builtin:NAME or none, repeatable")
     ap.add_argument("--frames", type=int, default=24, help="frames to score per config")
+    ap.add_argument("--scale", type=float, default=2.0,
+                    help="upscale factor the shaders provide, 2 for a 2x shader")
     ap.add_argument("--start", type=float, default=2.0, help="seconds into the clip to begin")
     ap.add_argument("--workdir", default=None, help="where to keep frames, a temp dir by default")
     ap.add_argument("--json", default=None, help="write results as JSON to this path")
@@ -405,6 +441,21 @@ def main():
                                    width, height, os.path.join(workdir, "reference"))
             offset = find_offset(cropped[0], refs)
             print(f"  capture geometry {width}x{height}, reference offset {offset}", flush=True)
+
+            # a shader that does not supply the ratio between the clip and the
+            # render area gets resampled, so say so rather than quietly folding
+            # the resample into the score
+            in_w, in_h = video_size(args.input)
+            rx = residual_scale(in_w, width, args.scale)
+            ry = residual_scale(in_h, height, args.scale)
+            if abs(rx - 1.0) > 0.005 or abs(ry - 1.0) > 0.005:
+                print(f"  warning: a {args.scale:g}x shader on a {in_w}x{in_h} clip lands at "
+                      f"{in_w * args.scale:g}x{in_h * args.scale:g}, not {width}x{height}. "
+                      f"the output is resampled by {rx:.3f}x{ry:.3f} before capture, which "
+                      f"compresses the differences between configs", flush=True)
+            else:
+                print(f"  {args.scale:g}x shader output lands on the render target exactly, "
+                      f"nothing is resampled", flush=True)
         elif geometry != (width, height):
             raise SystemExit(
                 f"{label} captured at {width}x{height} but an earlier config used "

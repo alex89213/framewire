@@ -22,6 +22,7 @@ SPEC_B="${3:-}"
 # portable: a tiling compositor sizes by layout, a floating one by request.
 # rather than fight it, the experiment is sized to it, so the shader lands on
 # the render target exactly and nothing is resampled on any desktop
+SCALE="${SCALE:-2}"
 CLIP_START="${CLIP_START:-60}"
 CLIP_LENGTH="${CLIP_LENGTH:-12}"
 COST_SECONDS="${COST_SECONDS:-20}"
@@ -38,6 +39,7 @@ usage: scripts/compare.sh SOURCE_VIDEO SPEC_A SPEC_B
     none                             mpv defaults
 
 environment:
+  SCALE                upscale factor the shaders provide, default 2
   CLIP_START           seconds into the source to sample, default 60
   CLIP_LENGTH          clip length in seconds, default 12
   COST_SECONDS         how long the live cost pass runs, default 20
@@ -77,9 +79,14 @@ echo "probing the render size this compositor gives mpv"
 GEOMETRY="$(python3 "$QUALITY" --probe-geometry "$PROBE")"
 TARGET_W="${GEOMETRY%x*}"
 TARGET_H="${GEOMETRY#*x}"
-HALF_W=$((TARGET_W / 2))
-HALF_H=$((TARGET_H / 2))
-echo "  render area ${TARGET_W}x${TARGET_H}, so the experiment is ${HALF_W}x${HALF_H} upscaled 2x"
+# the input is the render area divided by the upscale factor, so the shader
+# output lands on the render target with nothing left to resample
+HALF_W=$((TARGET_W / SCALE))
+HALF_H=$((TARGET_H / SCALE))
+echo "  render area ${TARGET_W}x${TARGET_H}, so the experiment is ${HALF_W}x${HALF_H} upscaled ${SCALE}x"
+if [[ $((HALF_W * SCALE)) -ne $TARGET_W || $((HALF_H * SCALE)) -ne $TARGET_H ]]; then
+  echo "  note: ${SCALE}x does not divide the render area evenly, so a small resample remains"
+fi
 echo
 
 REF="$WORKDIR/ref_${TARGET_W}x${TARGET_H}.mkv"
@@ -166,6 +173,7 @@ python3 "$QUALITY" \
   --reference "$REF" --input "$IN" \
   --spec "$SPEC_A" --spec "$SPEC_B" \
   --frames "$QUALITY_FRAMES" --start 2 \
+  --scale "$SCALE" \
   --expect-geometry "$GEOMETRY" \
   --cost-json "$COST_JSON"
 

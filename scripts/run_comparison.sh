@@ -1,127 +1,128 @@
 #!/usr/bin/env bash
 #
-# Description: Launches two mpv instances on the same video with different GPU
-#   shaders, starts a producer for each and opens the framewire dashboard.
+# Description: Launches one mpv instance per upscaler configuration on the same
+#   video, starts a producer for each and opens the live framewire dashboard.
+#   Cost only, with no quality pass.
 # Author: Alex Wu
 # Dependencies: mpv built with the gpu video output, framewire binaries
-# Usage: scripts/run_comparison.sh VIDEO [SHADER_A] [SHADER_B]
+# Usage: scripts/run_comparison.sh VIDEO SPEC [SPEC ...]
 #
 
 set -euo pipefail
 
 BUILD_DIR="${BUILD_DIR:-build}"
-VIDEO="${1:-}"
-SHADER_A="${2:-}"
-SHADER_B="${3:-}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+QUALITY="$HERE/quality.py"
 
-SOCK_A=/tmp/framewire-mpv-a-$$.sock
-SOCK_B=/tmp/framewire-mpv-b-$$.sock
-SHM_A=/framewire-a-$$
-SHM_B=/framewire-b-$$
+VIDEO="${1:-}"
+shift || true
+SPECS=("$@")
 
 # mpv only fills in vo-passes for the gpu video outputs, so the choice is not
 # optional. gpu-next is preferred when the local mpv supports it
 VO="${FRAMEWIRE_VO:-gpu-next}"
 
-if [[ -z "$VIDEO" ]]; then
+if [[ -z "$VIDEO" || ${#SPECS[@]} -lt 2 ]]; then
   cat >&2 <<'USAGE'
-usage: scripts/run_comparison.sh VIDEO [SHADER_A] [SHADER_B]
+usage: scripts/run_comparison.sh VIDEO SPEC [SPEC ...]
 
-  VIDEO       file both instances play
-  SHADER_A    glsl shader for the left panel, empty means no shader
-  SHADER_B    glsl shader for the right panel, empty means no shader
+  At least two configurations are needed. The first is the baseline that every
+  other one is reported against.
+
+  SPEC is one of:
+    shader:/path/to/upscaler.glsl    a custom GLSL shader
+    builtin:NAME                     an mpv scaler, for example ewa_lanczossharp
+    none                             mpv defaults
 
 environment:
-  BUILD_DIR       where the framewire binaries live (default build)
-  FRAMEWIRE_VO    mpv video output (default gpu-next)
-  LABEL_A         dashboard label for the left panel
-  LABEL_B         dashboard label for the right panel
-  DURATION        stop after this many seconds
-  MPV_EXTRA_A     extra mpv flags for the left panel, for example --scale=bilinear
-  MPV_EXTRA_B     extra mpv flags for the right panel
-  GEOMETRY_A      mpv --geometry for the left panel, for example 940x530+10+40
-  GEOMETRY_B      mpv --geometry for the right panel
+  BUILD_DIR       where the framewire binaries live, default build
+  FRAMEWIRE_VO    mpv video output, default gpu-next
+  DURATION        stop after this many seconds and print the report
+  JSON            also write the report as JSON to this path
+
+examples:
+  scripts/run_comparison.sh clip.mkv shader:espcn.glsl builtin:ewa_lanczossharp
+  scripts/run_comparison.sh clip.mkv shader:a.glsl shader:b.glsl shader:c.glsl none
 USAGE
   exit 2
 fi
 
-if [[ ! -f "$VIDEO" ]]; then
-  echo "no such video: $VIDEO" >&2
-  exit 1
-fi
-
+[[ -f "$VIDEO" ]] || { echo "no such video: $VIDEO" >&2; exit 1; }
 for binary in framewire framewire-producer; do
-  if [[ ! -x "$BUILD_DIR/$binary" ]]; then
-    echo "missing $BUILD_DIR/$binary, build first with: cmake -S . -B build && cmake --build build -j" >&2
-    exit 1
-  fi
+  [[ -x "$BUILD_DIR/$binary" ]] || {
+    echo "missing $BUILD_DIR/$binary, build with: cmake -S . -B build && cmake --build build -j" >&2
+    exit 1; }
 done
 
-LABEL_A="${LABEL_A:-$([[ -n "$SHADER_A" ]] && basename "$SHADER_A" .glsl || echo builtin-a)}"
-LABEL_B="${LABEL_B:-$([[ -n "$SHADER_B" ]] && basename "$SHADER_B" .glsl || echo builtin-b)}"
-
 PIDS=()
+SOCKETS=()
+RINGS=()
+LABELS=()
 
 cleanup() {
-  # kill the whole group rather than one pid at a time, so a half started run
-  # does not leave an mpv window or a producer behind
-  for pid in "${PIDS[@]:-}"; do
-    kill "$pid" 2>/dev/null || true
-  done
+  for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
-  rm -f "$SOCK_A" "$SOCK_B"
-  rm -f "/dev/shm${SHM_A}" "/dev/shm${SHM_B}" 2>/dev/null || true
+  for s in "${SOCKETS[@]:-}"; do rm -f "$s"; done
+  for r in "${RINGS[@]:-}"; do rm -f "/dev/shm${r}" 2>/dev/null || true; done
 }
 trap cleanup EXIT INT TERM
 
-start_mpv() {
-  local socket="$1" shader="$2" label="$3" extra="$4" geometry="$5"
-  local args=(
-    --input-ipc-server="$socket"
-    --vo="$VO"
-    # a user mpv.conf can set a scaler, a shader or a profile that would
-    # silently change the result without appearing anywhere in the output
-    --no-config
-    --no-resume-playback
-    --no-osc
-    --osd-level=0
-    --no-audio
-    --keep-open=no
-    --loop-file=inf
-    --title="framewire: $label"
-    --msg-level=all=error
-  )
-  if [[ -n "$shader" ]]; then
-    args+=(--glsl-shaders="$shader")
-  fi
-  if [[ -n "$geometry" ]]; then
-    args+=(--geometry="$geometry")
-  fi
-  # unquoted on purpose, the variable carries several separate mpv flags
-  if [[ -n "$extra" ]]; then
-    # shellcheck disable=SC2206
-    args+=($extra)
-  fi
-  mpv "${args[@]}" "$VIDEO" &
-  PIDS+=($!)
+spec_to_args() {
+  case "$1" in
+    none) ;;
+    shader:*) printf -- '--glsl-shaders=%s\n--scale=bilinear\n' "${1#shader:}" ;;
+    builtin:*) printf -- '--scale=%s\n' "${1#builtin:}" ;;
+    *) echo "bad spec: $1" >&2; exit 2 ;;
+  esac
 }
 
-echo "framewire: starting mpv instances with vo=$VO"
-start_mpv "$SOCK_A" "$SHADER_A" "$LABEL_A" "${MPV_EXTRA_A:-}" "${GEOMETRY_A:-}"
-start_mpv "$SOCK_B" "$SHADER_B" "$LABEL_B" "${MPV_EXTRA_B:-}" "${GEOMETRY_B:-}"
+for i in "${!SPECS[@]}"; do
+  LABELS+=("$(python3 "$QUALITY" --print-label "${SPECS[$i]}")")
+  SOCKETS+=("/tmp/framewire-cmp-${i}-$$.sock")
+  RINGS+=("/framewire-cmp-${i}-$$")
+done
 
-# the producers retry the connect themselves, so no sleep is needed here beyond
-# giving mpv a moment to get past its own startup
+echo "framewire: ${#SPECS[@]} streams with vo=$VO"
+for i in "${!SPECS[@]}"; do
+  if [[ $i -eq 0 ]]; then
+    echo "  [$i] ${LABELS[$i]}  (baseline)"
+  else
+    echo "  [$i] ${LABELS[$i]}"
+  fi
+done
+
+for i in "${!SPECS[@]}"; do
+  extra=()
+  mapfile -t extra < <(spec_to_args "${SPECS[$i]}")
+
+  # --no-config matters as much as any measurement choice here. a user mpv.conf
+  # can set a scaler, a shader or a profile that would silently change the
+  # result without appearing anywhere in the output
+  mpv "$VIDEO" \
+    --no-config --no-resume-playback --no-audio --no-osc --osd-level=0 \
+    --input-ipc-server="${SOCKETS[$i]}" --vo="$VO" --loop-file=inf --keep-open=no \
+    --title="framewire: ${LABELS[$i]}" --msg-level=all=error \
+    "${extra[@]}" >/dev/null 2>&1 &
+  PIDS+=($!)
+done
+
+# the producers retry the connect themselves, so this only gives mpv a moment
+# to get past its own startup
 sleep 1
 
-"$BUILD_DIR/framewire-producer" --socket "$SOCK_A" --shm "$SHM_A" --label "$LABEL_A" &
-PIDS+=($!)
-"$BUILD_DIR/framewire-producer" --socket "$SOCK_B" --shm "$SHM_B" --label "$LABEL_B" &
-PIDS+=($!)
+CONSUMER_ARGS=()
+for i in "${!SPECS[@]}"; do
+  "$BUILD_DIR/framewire-producer" --socket "${SOCKETS[$i]}" --shm "${RINGS[$i]}" \
+    --label "${LABELS[$i]}" 2>/dev/null &
+  PIDS+=($!)
+  CONSUMER_ARGS+=(--shm "${RINGS[$i]}" --label "${LABELS[$i]}")
+done
 
-CONSUMER_ARGS=(--shm-a "$SHM_A" --shm-b "$SHM_B")
 if [[ -n "${DURATION:-}" ]]; then
   CONSUMER_ARGS+=(--duration "$DURATION")
+fi
+if [[ -n "${JSON:-}" ]]; then
+  CONSUMER_ARGS+=(--json "$JSON")
 fi
 
 "$BUILD_DIR/framewire" "${CONSUMER_ARGS[@]}"

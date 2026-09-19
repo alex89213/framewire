@@ -9,6 +9,7 @@
 #include "framewire/stats.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +20,9 @@ namespace {
 
 // a producer that has not checked in for this long is treated as gone
 constexpr uint64_t kProducerStaleNs = 2ull * 1000 * 1000 * 1000;
+
+// standard normal quantile for a two sided 95 percent interval
+constexpr double kZ95 = 1.959964;
 
 QuantileSet FromWindow(const SampleWindow& w) {
   QuantileSet q;
@@ -212,144 +216,211 @@ int64_t Correlator::PairingKey(const TelemetryRecord& rec) const {
   return static_cast<int64_t>(rec.t_mono_ns);
 }
 
-Correlator::Correlator(uint64_t tolerance_ns) : tolerance_ns_(tolerance_ns) {
-  pass_delta_.reserve(kMaxPasses);
-  pass_a_.reserve(kMaxPasses);
-  pass_b_.reserve(kMaxPasses);
-  for (unsigned i = 0; i < kMaxPasses; ++i) {
-    pass_delta_.emplace_back();
-    pass_a_.emplace_back();
-    pass_b_.emplace_back();
+Correlator::Correlator(size_t stream_count, uint64_t tolerance_ns)
+    : tolerance_ns_(tolerance_ns) {
+  if (stream_count < 2) stream_count = 2;
+
+  media_seen_.assign(stream_count, false);
+  queues_.resize(stream_count);
+  gpu_delta_.resize(stream_count);
+  gpu_grouped_.resize(stream_count);
+  cheaper_than_baseline_.assign(stream_count, 0);
+  unmatched_.assign(stream_count, 0);
+
+  pass_delta_.resize(kMaxPasses);
+  pass_a_.resize(kMaxPasses);
+  pass_b_.resize(kMaxPasses);
+}
+
+void Correlator::Push(size_t stream, const std::vector<TelemetryRecord>& records) {
+  if (stream >= queues_.size()) return;
+
+  for (const auto& r : records) {
+    if (r.media_time_ns > 0) media_seen_[stream] = true;
+    queues_[stream].push_back(r);
+  }
+
+  // media position is only usable as the key when every stream carries one
+  use_media_time_ = true;
+  for (const bool seen : media_seen_) {
+    if (!seen) use_media_time_ = false;
   }
 }
 
-void Correlator::PushA(const std::vector<TelemetryRecord>& records) {
-  for (const auto& r : records) {
-    if (r.media_time_ns > 0) media_seen_a_ = true;
-    queue_a_.push_back(r);
-  }
-  use_media_time_ = media_seen_a_ && media_seen_b_;
-}
+void Correlator::EmitGroup() {
+  const TelemetryRecord& base = queues_[0].front();
+  const auto base_gpu = static_cast<int64_t>(base.gpu_total_ns);
+  gpu_grouped_[0].Record(base.gpu_total_ns);
 
-void Correlator::PushB(const std::vector<TelemetryRecord>& records) {
-  for (const auto& r : records) {
-    if (r.media_time_ns > 0) media_seen_b_ = true;
-    queue_b_.push_back(r);
+  for (size_t i = 1; i < queues_.size(); ++i) {
+    const TelemetryRecord& rec = queues_[i].front();
+    const auto delta = static_cast<int64_t>(rec.gpu_total_ns) - base_gpu;
+    gpu_delta_[i].Record(delta);
+    gpu_grouped_[i].Record(rec.gpu_total_ns);
+    if (delta < 0) ++cheaper_than_baseline_[i];
   }
-  use_media_time_ = media_seen_a_ && media_seen_b_;
+
+  // per pass differences only mean something when both sides ran the same
+  // number of passes, otherwise pass three of one chain is compared against
+  // unrelated work in the other. only tracked for a straight two way run
+  if (queues_.size() == 2) {
+    const TelemetryRecord& other = queues_[1].front();
+    if (base.pass_count == other.pass_count) {
+      const unsigned passes = std::min<unsigned>(base.pass_count, kMaxPasses);
+      for (unsigned p = 0; p < passes; ++p) {
+        pass_delta_[p].Record(static_cast<int64_t>(other.pass_ns[p]) -
+                              static_cast<int64_t>(base.pass_ns[p]));
+        pass_a_[p].Record(base.pass_ns[p]);
+        pass_b_[p].Record(other.pass_ns[p]);
+      }
+    }
+  }
+
+  ++grouped_;
+  for (auto& q : queues_) q.pop_front();
 }
 
 void Correlator::Process(bool flush) {
-  while (!queue_a_.empty() && !queue_b_.empty()) {
-    const TelemetryRecord& a = queue_a_.front();
-    const TelemetryRecord& b = queue_b_.front();
+  const auto window = static_cast<int64_t>(tolerance_ns_);
 
-    const int64_t key_a = PairingKey(a);
-    const int64_t key_b = PairingKey(b);
-    const int64_t window = static_cast<int64_t>(tolerance_ns_);
-
-    if (key_a + window < key_b) {
-      // every later b is further away still, so this a can never be matched
-      ++unmatched_a_;
-      queue_a_.pop_front();
-      continue;
-    }
-    if (key_b + window < key_a) {
-      ++unmatched_b_;
-      queue_b_.pop_front();
-      continue;
+  for (;;) {
+    // every stream has to have something before any decision can be made
+    for (const auto& q : queues_) {
+      if (q.empty()) goto drain;
     }
 
-    const auto delta =
-        static_cast<int64_t>(b.gpu_total_ns) - static_cast<int64_t>(a.gpu_total_ns);
-    gpu_delta_.Record(delta);
-    if (delta > 0) ++a_faster_;
+    {
+      size_t earliest = 0;
+      int64_t min_key = PairingKey(queues_[0].front());
+      int64_t max_key = min_key;
 
-    // per pass differences only mean something when both sides ran the same
-    // number of passes, otherwise pass three of one chain is compared against
-    // unrelated work in the other
-    if (a.pass_count == b.pass_count) {
-      const unsigned passes = std::min<unsigned>(a.pass_count, kMaxPasses);
-      for (unsigned p = 0; p < passes; ++p) {
-        pass_delta_[p].Record(static_cast<int64_t>(b.pass_ns[p]) -
-                              static_cast<int64_t>(a.pass_ns[p]));
-        pass_a_[p].Record(a.pass_ns[p]);
-        pass_b_[p].Record(b.pass_ns[p]);
+      for (size_t i = 1; i < queues_.size(); ++i) {
+        const int64_t key = PairingKey(queues_[i].front());
+        if (key < min_key) {
+          min_key = key;
+          earliest = i;
+        }
+        if (key > max_key) max_key = key;
       }
-    }
 
-    ++paired_;
-    queue_a_.pop_front();
-    queue_b_.pop_front();
+      if (max_key - min_key <= window) {
+        EmitGroup();
+        continue;
+      }
+
+      // the earliest front is further from the latest than the window allows,
+      // and every record still to come is later still, so it can never match
+      ++unmatched_[earliest];
+      queues_[earliest].pop_front();
+    }
   }
 
+drain:
   if (flush) {
-    unmatched_a_ += queue_a_.size();
-    unmatched_b_ += queue_b_.size();
-    queue_a_.clear();
-    queue_b_.clear();
+    for (size_t i = 0; i < queues_.size(); ++i) {
+      unmatched_[i] += queues_[i].size();
+      queues_[i].clear();
+    }
     return;
   }
 
-  // one side can run far ahead when the other producer stalls. the queues are
-  // capped so a stalled partner costs bounded memory instead of growing until
-  // the process is killed
+  // one stream can run far ahead when another stalls. the queues are capped so
+  // a stalled partner costs bounded memory instead of growing until the
+  // process is killed
   constexpr size_t kMaxQueued = 1u << 16;
-  while (queue_a_.size() > kMaxQueued) {
-    ++unmatched_a_;
-    queue_a_.pop_front();
-  }
-  while (queue_b_.size() > kMaxQueued) {
-    ++unmatched_b_;
-    queue_b_.pop_front();
+  for (size_t i = 0; i < queues_.size(); ++i) {
+    while (queues_[i].size() > kMaxQueued) {
+      ++unmatched_[i];
+      queues_[i].pop_front();
+    }
   }
 }
 
-ComparisonSnapshot Correlator::Snapshot(const StreamSnapshot& a, const StreamSnapshot& b) const {
+ComparisonSnapshot Correlator::Snapshot(const std::vector<StreamSnapshot>& streams) const {
   ComparisonSnapshot c;
-  c.paired = paired_;
-  c.unmatched_a = unmatched_a_;
-  c.unmatched_b = unmatched_b_;
+  c.grouped = grouped_;
+  c.unmatched = unmatched_;
 
-  c.gpu_delta_p50 = gpu_delta_.ValueAtQuantile(kQ50);
-  c.gpu_delta_p99 = gpu_delta_.ValueAtQuantile(kQ99);
-  c.gpu_delta_mean = gpu_delta_.Mean();
-  if (paired_ > 0) {
-    c.a_faster_fraction = static_cast<double>(a_faster_) / static_cast<double>(paired_);
-  }
-  if (b.gpu_life.p50 > 0) {
-    c.speedup = static_cast<double>(a.gpu_life.p50) / static_cast<double>(b.gpu_life.p50);
+  const uint64_t baseline_p50 = gpu_grouped_.empty() ? 0 : gpu_grouped_[0].ValueAtQuantile(kQ50);
+
+  for (size_t i = 0; i < queues_.size(); ++i) {
+    StreamComparison sc;
+    sc.label = i < streams.size() ? streams[i].label : ("stream " + std::to_string(i));
+    sc.is_baseline = (i == 0);
+    sc.gpu_p50 = gpu_grouped_[i].ValueAtQuantile(kQ50);
+
+    if (i != 0) {
+      sc.delta_p50 = gpu_delta_[i].ValueAtQuantile(kQ50);
+      if (grouped_ > 0) {
+        sc.cheaper_fraction =
+            static_cast<double>(cheaper_than_baseline_[i]) / static_cast<double>(grouped_);
+        WilsonInterval(cheaper_than_baseline_[i], grouped_, kZ95, &sc.cheaper_low,
+                       &sc.cheaper_high);
+      }
+      if (sc.gpu_p50 > 0) {
+        sc.speedup = static_cast<double>(baseline_p50) / static_cast<double>(sc.gpu_p50);
+      }
+
+      sc.interval_valid = gpu_delta_[i].QuantileInterval(kQ50, kZ95, &sc.delta_p50_low,
+                                                         &sc.delta_p50_high);
+      // a difference is only worth calling a result when the whole interval
+      // sits on one side of zero
+      sc.significant = sc.interval_valid &&
+                       ((sc.delta_p50_low > 0 && sc.delta_p50_high > 0) ||
+                        (sc.delta_p50_low < 0 && sc.delta_p50_high < 0));
+    } else {
+      sc.speedup = 1.0;
+    }
+    c.streams.push_back(std::move(sc));
   }
 
-  const size_t pass_count = std::min(a.passes.size(), b.passes.size());
-  for (size_t p = 0; p < pass_count; ++p) {
-    if (pass_delta_[p].empty()) continue;
-    PassDelta d;
-    d.name = a.passes[p].name;
-    d.delta_p50 = pass_delta_[p].ValueAtQuantile(kQ50);
-    d.a_p50 = pass_a_[p].ValueAtQuantile(kQ50);
-    d.b_p50 = pass_b_[p].ValueAtQuantile(kQ50);
-    c.pass_deltas.push_back(std::move(d));
+  if (queues_.size() == 2 && streams.size() == 2) {
+    const size_t pass_count = std::min(streams[0].passes.size(), streams[1].passes.size());
+    for (size_t p = 0; p < pass_count; ++p) {
+      if (pass_delta_[p].empty()) continue;
+      PassDelta d;
+      d.name = streams[0].passes[p].name;
+      d.delta_p50 = pass_delta_[p].ValueAtQuantile(kQ50);
+      d.a_p50 = pass_a_[p].ValueAtQuantile(kQ50);
+      d.b_p50 = pass_b_[p].ValueAtQuantile(kQ50);
+      c.pass_deltas.push_back(std::move(d));
+    }
   }
   return c;
 }
 
 void Correlator::Reset() {
-  queue_a_.clear();
-  queue_b_.clear();
-  gpu_delta_.Reset();
+  for (auto& q : queues_) q.clear();
+  for (auto& w : gpu_delta_) w.Reset();
+  for (auto& w : gpu_grouped_) w.Reset();
+  std::fill(cheaper_than_baseline_.begin(), cheaper_than_baseline_.end(), 0);
+  std::fill(unmatched_.begin(), unmatched_.end(), 0);
   for (unsigned i = 0; i < kMaxPasses; ++i) {
     pass_delta_[i].Reset();
     pass_a_[i].Reset();
     pass_b_[i].Reset();
   }
-  paired_ = 0;
-  unmatched_a_ = 0;
-  unmatched_b_ = 0;
-  a_faster_ = 0;
+  grouped_ = 0;
   use_media_time_ = false;
-  media_seen_a_ = false;
-  media_seen_b_ = false;
+  std::fill(media_seen_.begin(), media_seen_.end(), false);
+}
+
+void WilsonInterval(uint64_t successes, uint64_t trials, double z, double* low, double* high) {
+  if (trials == 0) {
+    *low = 0.0;
+    *high = 0.0;
+    return;
+  }
+
+  const double n = static_cast<double>(trials);
+  const double p = static_cast<double>(successes) / n;
+  const double z2 = z * z;
+  const double denom = 1.0 + z2 / n;
+  const double centre = (p + z2 / (2.0 * n)) / denom;
+  const double margin = (z * std::sqrt(p * (1.0 - p) / n + z2 / (4.0 * n * n))) / denom;
+
+  *low = std::max(0.0, centre - margin);
+  *high = std::min(1.0, centre + margin);
 }
 
 std::map<std::string, std::string> ParseEnvironment(const std::string& text) {

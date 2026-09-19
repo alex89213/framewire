@@ -175,6 +175,25 @@ class SignedWindow {
    */
   int64_t ValueAtQuantile(double quantile) const;
 
+  /*
+   * Reads a distribution free confidence interval for a quantile.
+   *
+   * The interval comes from order statistics rather than a bootstrap. Both are
+   * defensible, but this one is exact under nothing more than independent
+   * samples, needs a single sort instead of hundreds of resamples, and has no
+   * random seed, so the same data always gives the same interval. That matters
+   * for a number the dashboard recomputes ten times a second.
+   *
+   * Args:
+   *   quantile: Position in the distribution, 0.0 through 1.0.
+   *   z: Standard normal quantile for the confidence wanted, 1.96 for 95%.
+   *   low: Receives the lower bound.
+   *   high: Receives the upper bound.
+   * Returns:
+   *   True when the window held enough samples for an interval.
+   */
+  bool QuantileInterval(double quantile, double z, int64_t* low, int64_t* high) const;
+
   double Mean() const;
   size_t size() const { return size_; }
   bool empty() const { return size_ == 0; }

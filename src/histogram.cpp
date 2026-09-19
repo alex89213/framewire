@@ -246,6 +246,36 @@ int64_t SignedWindow::ValueAtQuantile(double quantile) const {
   return scratch_[rank - 1];
 }
 
+bool SignedWindow::QuantileInterval(double quantile, double z, int64_t* low,
+                                    int64_t* high) const {
+  *low = 0;
+  *high = 0;
+  // below this the interval is wider than the data and says nothing useful
+  if (size_ < 8) return false;
+
+  if (quantile < 0.0) quantile = 0.0;
+  if (quantile > 1.0) quantile = 1.0;
+
+  scratch_.assign(values_.begin(), values_.begin() + static_cast<ptrdiff_t>(size_));
+  std::sort(scratch_.begin(), scratch_.end());
+
+  const auto n = static_cast<double>(size_);
+  // the count of samples below the quantile is binomial, so the order
+  // statistics either side of its normal approximation bracket the quantile
+  const double centre = n * quantile;
+  const double spread = z * std::sqrt(n * quantile * (1.0 - quantile));
+
+  auto clamp_index = [this](double v) -> size_t {
+    if (v < 0.0) return 0;
+    const auto idx = static_cast<size_t>(v);
+    return idx >= size_ ? size_ - 1 : idx;
+  };
+
+  *low = scratch_[clamp_index(std::floor(centre - spread))];
+  *high = scratch_[clamp_index(std::ceil(centre + spread))];
+  return true;
+}
+
 double SignedWindow::Mean() const {
   if (size_ == 0) return 0.0;
   double sum = 0.0;

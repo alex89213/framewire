@@ -130,41 +130,80 @@ std::string TwoColumn(const std::vector<std::string>& left, const std::vector<st
 
 }  // namespace
 
-void RenderDashboard(Screen& screen, const StreamSnapshot& a, const StreamSnapshot& b,
+// Builds one compact row per stream, used when panels stop fitting.
+std::vector<std::string> BuildStreamTable(const std::vector<StreamSnapshot>& streams,
+                                          const ComparisonSnapshot& cmp,
+                                          const DashboardState& st, size_t width) {
+  std::vector<std::string> rows;
+  const size_t name_room = width > 62 ? std::min<size_t>(28, width - 62) : 14;
+
+  rows.push_back(Format("%s %-*s %9s %9s %9s %7s %7s %6s%s", Colour(st, ansi::kBold),
+                        static_cast<int>(name_room), "stream", "gpu p50", "gpu p99", "delta",
+                        "fps", "frames", "drop", Colour(st, ansi::kReset)));
+
+  for (size_t i = 0; i < streams.size(); ++i) {
+    const StreamSnapshot& s = streams[i];
+    std::string name = s.label;
+    if (name.size() > name_room) name.resize(name_room);
+
+    std::string delta = "baseline";
+    if (i < cmp.streams.size() && !cmp.streams[i].is_baseline) {
+      delta = FormatSignedNanos(cmp.streams[i].delta_p50);
+    }
+
+    const char* accent = s.producer_alive ? "" : Colour(st, ansi::kRed);
+    rows.push_back(Format("%s %-*s %9s %9s %9s %7.1f %7llu %5.1f%%%s", accent,
+                          static_cast<int>(name_room), name.c_str(),
+                          FormatNanos(s.gpu_recent.p50).c_str(),
+                          FormatNanos(s.gpu_recent.p99).c_str(), delta.c_str(), s.fps_recent,
+                          static_cast<unsigned long long>(s.records),
+                          s.records > 0 ? 100.0 * static_cast<double>(s.dropped_frames) /
+                                              static_cast<double>(s.records)
+                                        : 0.0,
+                          Colour(st, ansi::kReset)));
+  }
+  return rows;
+}
+
+void RenderDashboard(Screen& screen, const std::vector<StreamSnapshot>& streams,
                      const ComparisonSnapshot& cmp, const DashboardState& state) {
   const auto width = static_cast<size_t>(std::max(screen.width(), 20));
   const int height = screen.height();
   int y = 0;
 
+  if (streams.empty()) return;
+
   const uint64_t secs = state.elapsed_ns / 1000000000ull;
-  std::string title = Format(" framewire  %s  %02llu:%02llu:%02llu  paired %llu ",
+  std::string title = Format(" framewire  %s  %02llu:%02llu:%02llu  %zu streams  grouped %llu ",
                              state.paused ? "PAUSED" : "live",
                              static_cast<unsigned long long>(secs / 3600),
                              static_cast<unsigned long long>((secs / 60) % 60),
-                             static_cast<unsigned long long>(secs % 60),
-                             static_cast<unsigned long long>(cmp.paired));
+                             static_cast<unsigned long long>(secs % 60), streams.size(),
+                             static_cast<unsigned long long>(cmp.grouped));
   screen.PutRow(y++, Format("%s%s%s", Colour(state, ansi::kReverse),
                             FitWidth(title, width).c_str(), Colour(state, ansi::kReset)));
   screen.PutRow(y++, "");
 
-  const bool side_by_side = static_cast<int>(width) >= kMinSideBySide;
-  const size_t col_width = side_by_side ? (width - kPanelGap) / 2 : width;
+  const bool two_panels = streams.size() == 2 && static_cast<int>(width) >= kMinSideBySide;
 
-  const auto panel_a = BuildPanel(a, state, col_width, ansi::kCyan);
-  const auto panel_b = BuildPanel(b, state, col_width, ansi::kMagenta);
-
-  if (side_by_side) {
+  if (two_panels) {
+    const size_t col_width = (width - kPanelGap) / 2;
+    const auto panel_a = BuildPanel(streams[0], state, col_width, ansi::kCyan);
+    const auto panel_b = BuildPanel(streams[1], state, col_width, ansi::kMagenta);
     const size_t rows = std::max(panel_a.size(), panel_b.size());
     for (size_t i = 0; i < rows && y < height; ++i) {
       screen.PutRow(y++, TwoColumn(panel_a, panel_b, i, col_width));
     }
-  } else {
-    for (const auto& row : panel_a) {
-      if (y >= height) break;
-      screen.PutRow(y++, FitWidth(row, width));
+  } else if (streams.size() == 2) {
+    for (const auto& s : streams) {
+      for (const auto& row : BuildPanel(s, state, width, ansi::kCyan)) {
+        if (y >= height) break;
+        screen.PutRow(y++, FitWidth(row, width));
+      }
+      if (y < height) screen.PutRow(y++, "");
     }
-    if (y < height) screen.PutRow(y++, "");
-    for (const auto& row : panel_b) {
+  } else {
+    for (const auto& row : BuildStreamTable(streams, cmp, state, width)) {
       if (y >= height) break;
       screen.PutRow(y++, FitWidth(row, width));
     }
@@ -172,64 +211,67 @@ void RenderDashboard(Screen& screen, const StreamSnapshot& a, const StreamSnapsh
 
   if (y < height) screen.PutRow(y++, "");
 
-  // comparison block
   if (y < height) {
-    const std::string heading = Format(" comparison  b minus a  ");
-    screen.PutRow(y++, Format("%s%s%s", Colour(state, ansi::kBold),
-                              FitWidth(heading + Repeat("─", width > heading.size() + 1
-                                                                 ? width - heading.size() - 1
-                                                                 : 0),
-                                       width)
-                                  .c_str(),
-                              Colour(state, ansi::kReset)));
+    const std::string heading = Format(" comparison against %s  ", streams[0].label.c_str());
+    screen.PutRow(y++,
+                  Format("%s%s%s", Colour(state, ansi::kBold),
+                         FitWidth(heading + Repeat("─", width > heading.size() + 1
+                                                            ? width - heading.size() - 1
+                                                            : 0),
+                                  width)
+                             .c_str(),
+                         Colour(state, ansi::kReset)));
   }
 
-  if (cmp.paired == 0) {
+  if (cmp.grouped == 0) {
     if (y < height) {
-      screen.PutRow(y++, Format("%s waiting for frames from both streams%s",
+      screen.PutRow(y++, Format("%s waiting for frames from every stream%s",
                                 Colour(state, ansi::kGrey), Colour(state, ansi::kReset)));
     }
   } else {
-    // a negative delta means stream b spent less gpu time, so b is the winner
-    const bool b_wins = cmp.gpu_delta_p50 < 0;
-    const char* verdict_colour = b_wins ? Colour(state, ansi::kMagenta) : Colour(state, ansi::kCyan);
-    const char* winner = b_wins ? b.label.c_str() : a.label.c_str();
+    for (size_t i = 1; i < cmp.streams.size() && y < height - 1; ++i) {
+      const StreamComparison& sc = cmp.streams[i];
+      // cheaper than the baseline is the interesting direction, so it is the
+      // one that gets the colour
+      const char* dc = !sc.significant
+                           ? Colour(state, ansi::kGrey)
+                           : (sc.delta_p50 < 0 ? Colour(state, ansi::kGreen)
+                                               : Colour(state, ansi::kYellow));
+      const std::string interval =
+          sc.interval_valid
+              ? Format("[%s, %s]", FormatSignedNanos(sc.delta_p50_low).c_str(),
+                       FormatSignedNanos(sc.delta_p50_high).c_str())
+              : std::string("[too few]");
+      screen.PutRow(y++, Format(" %-20s %s%-10s %-22s%s %5.1f%%  %.3fx%s", sc.label.c_str(), dc,
+                                FormatSignedNanos(sc.delta_p50).c_str(), interval.c_str(),
+                                Colour(state, ansi::kReset), sc.cheaper_fraction * 100.0,
+                                sc.speedup,
+                                sc.significant ? "" : "  (inside the noise)"));
+    }
 
-    if (y < height) {
-      screen.PutRow(y++, Format(" gpu delta   p50 %-10s p99 %-10s mean %s",
-                                FormatSignedNanos(cmp.gpu_delta_p50).c_str(),
-                                FormatSignedNanos(cmp.gpu_delta_p99).c_str(),
-                                FormatSignedNanos(static_cast<int64_t>(cmp.gpu_delta_mean)).c_str()));
-    }
-    if (y < height) {
-      screen.PutRow(y++,
-                    Format(" %sfaster%s      %s%s%s on %.1f%% of paired frames   speedup %.3fx",
-                           Colour(state, ansi::kBold), Colour(state, ansi::kReset), verdict_colour,
-                           winner, Colour(state, ansi::kReset),
-                           b_wins ? (1.0 - cmp.a_faster_fraction) * 100.0
-                                  : cmp.a_faster_fraction * 100.0,
-                           cmp.speedup));
-    }
-    if (y < height) {
-      screen.PutRow(y++, Format("%s unmatched   a %llu   b %llu%s", Colour(state, ansi::kGrey),
-                                static_cast<unsigned long long>(cmp.unmatched_a),
-                                static_cast<unsigned long long>(cmp.unmatched_b),
+    if (y < height - 1) {
+      std::string unmatched = " unmatched  ";
+      for (size_t i = 0; i < cmp.unmatched.size(); ++i) {
+        unmatched += Format("%s %llu   ", streams[i].label.c_str(),
+                            static_cast<unsigned long long>(cmp.unmatched[i]));
+      }
+      screen.PutRow(y++, Format("%s%s%s", Colour(state, ansi::kGrey), unmatched.c_str(),
                                 Colour(state, ansi::kReset)));
     }
 
-    if (!cmp.pass_deltas.empty() && y < height) {
+    if (!cmp.pass_deltas.empty() && y < height - 2) {
       screen.PutRow(y++, "");
-      if (y < height) {
+      if (y < height - 1) {
         screen.PutRow(y++, Format("%s per pass    %-20s %-10s %-10s %s%s",
-                                  Colour(state, ansi::kBold), "name", "a p50", "b p50", "delta",
-                                  Colour(state, ansi::kReset)));
+                                  Colour(state, ansi::kBold), "name", "baseline", "other",
+                                  "delta", Colour(state, ansi::kReset)));
       }
       for (const auto& d : cmp.pass_deltas) {
         if (y >= height - 1) break;
         std::string name = d.name;
         if (name.size() > 20) name.resize(20);
-        const char* dc = d.delta_p50 < 0 ? Colour(state, ansi::kMagenta)
-                                         : Colour(state, ansi::kCyan);
+        const char* dc =
+            d.delta_p50 < 0 ? Colour(state, ansi::kGreen) : Colour(state, ansi::kYellow);
         screen.PutRow(y++, Format("             %-20s %-10s %-10s %s%s%s", name.c_str(),
                                   FormatNanos(d.a_p50).c_str(), FormatNanos(d.b_p50).c_str(), dc,
                                   FormatSignedNanos(d.delta_p50).c_str(),
@@ -238,7 +280,6 @@ void RenderDashboard(Screen& screen, const StreamSnapshot& a, const StreamSnapsh
     }
   }
 
-  // footer pinned to the last row
   const std::string keys = state.status.empty()
                                ? std::string(" q quit   p pause   r reset stats ")
                                : " " + state.status + " ";
@@ -246,10 +287,9 @@ void RenderDashboard(Screen& screen, const StreamSnapshot& a, const StreamSnapsh
                                    FitWidth(keys, width).c_str(), Colour(state, ansi::kReset)));
 }
 
-std::string BuildTextReport(const StreamSnapshot& a, const StreamSnapshot& b,
+std::string BuildTextReport(const std::vector<StreamSnapshot>& streams,
                             const ComparisonSnapshot& cmp, uint64_t elapsed_ns) {
   std::string out;
-
   auto line = [&out](const std::string& s) {
     out += s;
     out.push_back('\n');
@@ -257,10 +297,69 @@ std::string BuildTextReport(const StreamSnapshot& a, const StreamSnapshot& b,
 
   line("framewire comparison report");
   line(Format("elapsed            %.1fs", static_cast<double>(elapsed_ns) / 1e9));
+  line(Format("streams            %zu", streams.size()));
   line("");
 
-  auto stream_block = [&](const StreamSnapshot& s, const char* tag) {
-    line(Format("[%s] %s", tag, s.label.c_str()));
+  for (size_t i = 0; i < streams.size(); ++i) {
+    const StreamSnapshot& s = streams[i];
+    const char* tag = i == 0 ? "baseline" : "stream";
+    if (s.environment.empty()) continue;
+    line(Format("[%s %zu] %s, capture environment", tag, i, s.label.c_str()));
+    for (const auto& kv : ParseEnvironment(s.environment)) {
+      if (kv.second.empty()) continue;
+      line(Format("  %-16s %s", kv.first.c_str(), kv.second.c_str()));
+    }
+    if (s.geometry_changes > 0) {
+      line(Format("  %-16s %u times during the run", "window resized", s.geometry_changes));
+    }
+    line("");
+  }
+
+  // any pair captured under different conditions poisons the whole comparison,
+  // so every stream is checked against the baseline
+  std::vector<std::string> all_mismatches;
+  for (size_t i = 1; i < streams.size(); ++i) {
+    for (const auto& m : EnvironmentMismatches(streams[0].environment, streams[i].environment)) {
+      all_mismatches.push_back(streams[i].label + " vs " + streams[0].label + ", " + m);
+    }
+  }
+  if (!all_mismatches.empty()) {
+    line("[warning] streams were not captured under the same conditions,");
+    line("          so the comparison below is not a like for like measurement:");
+    for (const auto& m : all_mismatches) line("  " + m);
+    line("");
+  }
+
+  bool resized = false;
+  for (const auto& s : streams) {
+    if (s.geometry_changes > 0) resized = true;
+  }
+  if (resized) {
+    line("[warning] a window changed size mid run, so timings before and after the");
+    line("          change describe different render targets");
+    line("");
+  }
+
+  // players rendering the same file should present at the same rate. a large
+  // split means one window is not rendering normally, which on a compositor
+  // that throttles hidden surfaces produces timings that look fast but
+  // describe almost no work
+  double fps_hi = 0.0;
+  double fps_lo = 1e9;
+  for (const auto& s : streams) {
+    fps_hi = std::max(fps_hi, s.fps);
+    fps_lo = std::min(fps_lo, s.fps);
+  }
+  if (fps_hi > 1.0 && (fps_hi - fps_lo) / fps_hi > 0.10) {
+    line(Format("[warning] frame rates differ by %.0f%% across streams (%.1f to %.1f). one "
+                "player may be occluded or throttled, so the comparison is not trustworthy",
+                100.0 * (fps_hi - fps_lo) / fps_hi, fps_lo, fps_hi));
+    line("");
+  }
+
+  for (size_t i = 0; i < streams.size(); ++i) {
+    const StreamSnapshot& s = streams[i];
+    line(Format("[%zu] %s%s", i, s.label.c_str(), i == 0 ? "  (baseline)" : ""));
     line(Format("  frames           %llu", static_cast<unsigned long long>(s.records)));
     line(Format("  fps              %.2f run, %.2f recent", s.fps, s.fps_recent));
     line(Format("  gpu p50/p99/p999 %s / %s / %s", FormatNanos(s.gpu_life.p50).c_str(),
@@ -279,86 +378,71 @@ std::string BuildTextReport(const StreamSnapshot& a, const StreamSnapshot& b,
     line(Format("  ring lost        %llu", static_cast<unsigned long long>(s.producer_drops)));
     line(Format("  checksum errors  %llu", static_cast<unsigned long long>(s.checksum_errors)));
     line(Format("  sequence gaps    %llu", static_cast<unsigned long long>(s.sequence_gaps)));
-    for (size_t i = 0; i < s.passes.size(); ++i) {
-      const PassView& p = s.passes[i];
-      line(Format("  pass %-2zu %-24s p50 %-9s p99 %s", i,
-                  p.name.empty() ? "(unnamed)" : p.name.c_str(), FormatNanos(p.p50).c_str(),
-                  FormatNanos(p.p99).c_str()));
+    for (size_t p = 0; p < s.passes.size(); ++p) {
+      const PassView& v = s.passes[p];
+      line(Format("  pass %-2zu %-24s p50 %-9s p99 %s", p,
+                  v.name.empty() ? "(unnamed)" : v.name.c_str(), FormatNanos(v.p50).c_str(),
+                  FormatNanos(v.p99).c_str()));
     }
-    line("");
-  };
-
-  stream_block(a, "a");
-  stream_block(b, "b");
-
-  auto env_block = [&](const StreamSnapshot& s, const char* tag) {
-    if (s.environment.empty()) return;
-    line(Format("[%s] capture environment", tag));
-    for (const auto& kv : ParseEnvironment(s.environment)) {
-      if (kv.second.empty()) continue;
-      line(Format("  %-16s %s", kv.first.c_str(), kv.second.c_str()));
-    }
-    if (s.geometry_changes > 0) {
-      line(Format("  %-16s %u times during the run", "window resized", s.geometry_changes));
-    }
-    line("");
-  };
-  env_block(a, "a");
-  env_block(b, "b");
-
-  const auto mismatches = EnvironmentMismatches(a.environment, b.environment);
-  if (!mismatches.empty()) {
-    line("[warning] the two streams were not captured under the same conditions,");
-    line("          so the comparison below is not a like for like measurement:");
-    for (const auto& m : mismatches) line("  " + m);
-    line("");
-  }
-  if (a.geometry_changes > 0 || b.geometry_changes > 0) {
-    line("[warning] a window changed size mid run, so timings before and after the");
-    line("          change describe different render targets");
     line("");
   }
 
-  // two players rendering the same file should present at the same rate. a
-  // large split means one window is not rendering normally, which on a
-  // compositor that throttles hidden surfaces produces timings that look fast
-  // but describe almost no work
-  const double fps_hi = std::max(a.fps, b.fps);
-  const double fps_lo = std::min(a.fps, b.fps);
-  if (fps_hi > 1.0 && (fps_hi - fps_lo) / fps_hi > 0.10) {
-    line(Format("[warning] frame rates differ by %.0f%% (%.1f vs %.1f). one player may be "
-                "occluded or throttled, so the comparison below is not trustworthy",
-                100.0 * (fps_hi - fps_lo) / fps_hi, a.fps, b.fps));
-    line("");
+  line("[comparison] grouped frames only");
+  line(Format("  grouped          %llu", static_cast<unsigned long long>(cmp.grouped)));
+  for (size_t i = 0; i < cmp.unmatched.size() && i < streams.size(); ++i) {
+    line(Format("  unmatched %-14s %llu", streams[i].label.c_str(),
+                static_cast<unsigned long long>(cmp.unmatched[i])));
+  }
+  line("");
+  line(Format("  %-22s %-11s %-11s %-24s %-22s %s", "stream", "gpu p50", "delta",
+              "delta 95% interval", "cheaper on", "speedup"));
+  for (const auto& sc : cmp.streams) {
+    if (sc.is_baseline) {
+      line(Format("  %-22s %-11s %-11s %-24s %-22s %s", sc.label.c_str(),
+                  FormatNanos(sc.gpu_p50).c_str(), "baseline", "-", "-", "1.000x"));
+      continue;
+    }
+    const std::string interval =
+        sc.interval_valid ? Format("[%s, %s]", FormatSignedNanos(sc.delta_p50_low).c_str(),
+                                   FormatSignedNanos(sc.delta_p50_high).c_str())
+                          : std::string("too few samples");
+    const std::string cheaper = Format("%.1f%% [%.1f, %.1f]", sc.cheaper_fraction * 100.0,
+                                       sc.cheaper_low * 100.0, sc.cheaper_high * 100.0);
+    line(Format("  %-22s %-11s %-11s %-24s %-22s %.3fx", sc.label.c_str(),
+                FormatNanos(sc.gpu_p50).c_str(), FormatSignedNanos(sc.delta_p50).c_str(),
+                interval.c_str(), cheaper.c_str(), sc.speedup));
   }
 
-  line("[comparison] paired frames only");
-  line(Format("  paired           %llu", static_cast<unsigned long long>(cmp.paired)));
-  line(Format("  unmatched a / b  %llu / %llu", static_cast<unsigned long long>(cmp.unmatched_a),
-              static_cast<unsigned long long>(cmp.unmatched_b)));
-  line(Format("  gpu delta p50    %s", FormatSignedNanos(cmp.gpu_delta_p50).c_str()));
-  line(Format("  gpu delta p99    %s", FormatSignedNanos(cmp.gpu_delta_p99).c_str()));
-  line(Format("  gpu delta mean   %s",
-              FormatSignedNanos(static_cast<int64_t>(cmp.gpu_delta_mean)).c_str()));
-  line(Format("  a faster on      %.2f%% of pairs", cmp.a_faster_fraction * 100.0));
-  line(Format("  speedup a over b %.4fx", cmp.speedup));
+  // an interval that straddles zero means the run did not separate the two, and
+  // saying so is more useful than quoting the point estimate and staying quiet
+  line("");
+  for (const auto& sc : cmp.streams) {
+    if (sc.is_baseline) continue;
+    if (!sc.interval_valid) {
+      line(Format("  %s: too few grouped frames to say anything", sc.label.c_str()));
+    } else if (!sc.significant) {
+      line(Format("  %s: no separation from %s, the interval crosses zero",
+                  sc.label.c_str(), cmp.streams[0].label.c_str()));
+    } else {
+      line(Format("  %s: %s than %s, and the whole interval agrees", sc.label.c_str(),
+                  sc.delta_p50 < 0 ? "cheaper" : "dearer", cmp.streams[0].label.c_str()));
+    }
+  }
 
   for (const auto& d : cmp.pass_deltas) {
-    line(Format("  pass %-24s a %-9s b %-9s delta %s",
+    line(Format("  pass %-24s baseline %-9s other %-9s delta %s",
                 d.name.empty() ? "(unnamed)" : d.name.c_str(), FormatNanos(d.a_p50).c_str(),
                 FormatNanos(d.b_p50).c_str(), FormatSignedNanos(d.delta_p50).c_str()));
   }
   return out;
 }
 
-
-
-std::string BuildJsonReport(const StreamSnapshot& a, const StreamSnapshot& b,
+std::string BuildJsonReport(const std::vector<StreamSnapshot>& streams,
                             const ComparisonSnapshot& cmp, uint64_t elapsed_ns) {
   std::string out;
 
-  auto stream_object = [](const StreamSnapshot& s) {
-    std::string o = "{\"label\":";
+  auto stream_object = [](const StreamSnapshot& s, size_t index) {
+    std::string o = "{\"index\":" + std::to_string(index) + ",\"label\":";
     JsonEscapeTo(o, s.label);
     o += Format(",\"frames\":%llu", static_cast<unsigned long long>(s.records));
     o += Format(",\"fps\":%.4f", s.fps);
@@ -402,27 +486,54 @@ std::string BuildJsonReport(const StreamSnapshot& a, const StreamSnapshot& b,
     return o;
   };
 
-  out += "{\"schema\":\"framewire.cost.v1\"";
+  out += "{\"schema\":\"framewire.cost.v2\"";
   out += Format(",\"elapsed_ns\":%llu", static_cast<unsigned long long>(elapsed_ns));
-  out += ",\"a\":" + stream_object(a);
-  out += ",\"b\":" + stream_object(b);
-  out += ",\"comparison\":{";
-  out += Format("\"paired\":%llu", static_cast<unsigned long long>(cmp.paired));
-  out += Format(",\"unmatched_a\":%llu", static_cast<unsigned long long>(cmp.unmatched_a));
-  out += Format(",\"unmatched_b\":%llu", static_cast<unsigned long long>(cmp.unmatched_b));
-  out += Format(",\"gpu_delta_p50_ns\":%lld", static_cast<long long>(cmp.gpu_delta_p50));
-  out += Format(",\"gpu_delta_p99_ns\":%lld", static_cast<long long>(cmp.gpu_delta_p99));
-  out += Format(",\"a_faster_fraction\":%.6f", cmp.a_faster_fraction);
-  out += Format(",\"speedup_a_over_b\":%.6f", cmp.speedup);
-  out += "}";
 
-  // a consumer of this file should be able to see that the two sides were not
-  // comparable without having to work it out from the environment blocks
-  out += ",\"environment_mismatches\":[";
-  const auto mismatches = EnvironmentMismatches(a.environment, b.environment);
-  for (size_t i = 0; i < mismatches.size(); ++i) {
+  out += ",\"streams\":[";
+  for (size_t i = 0; i < streams.size(); ++i) {
     if (i != 0) out.push_back(',');
-    JsonEscapeTo(out, mismatches[i]);
+    out += stream_object(streams[i], i);
+  }
+  out += "]";
+
+  out += ",\"comparison\":{";
+  out += Format("\"grouped\":%llu", static_cast<unsigned long long>(cmp.grouped));
+  out += ",\"unmatched\":[";
+  for (size_t i = 0; i < cmp.unmatched.size(); ++i) {
+    if (i != 0) out.push_back(',');
+    out += std::to_string(cmp.unmatched[i]);
+  }
+  out += "],\"streams\":[";
+  for (size_t i = 0; i < cmp.streams.size(); ++i) {
+    const StreamComparison& sc = cmp.streams[i];
+    if (i != 0) out.push_back(',');
+    out += "{\"label\":";
+    JsonEscapeTo(out, sc.label);
+    out += Format(",\"is_baseline\":%s", sc.is_baseline ? "true" : "false");
+    out += Format(",\"gpu_p50_ns\":%llu", static_cast<unsigned long long>(sc.gpu_p50));
+    out += Format(",\"delta_p50_ns\":%lld", static_cast<long long>(sc.delta_p50));
+    out += Format(",\"cheaper_fraction\":%.6f", sc.cheaper_fraction);
+    out += Format(",\"speedup_vs_baseline\":%.6f", sc.speedup);
+    out += Format(",\"delta_p50_ci95_low_ns\":%lld", static_cast<long long>(sc.delta_p50_low));
+    out += Format(",\"delta_p50_ci95_high_ns\":%lld", static_cast<long long>(sc.delta_p50_high));
+    out += Format(",\"cheaper_ci95_low\":%.6f", sc.cheaper_low);
+    out += Format(",\"cheaper_ci95_high\":%.6f", sc.cheaper_high);
+    out += Format(",\"interval_valid\":%s", sc.interval_valid ? "true" : "false");
+    out += Format(",\"significant\":%s", sc.significant ? "true" : "false");
+    out.push_back('}');
+  }
+  out += "]}";
+
+  // a reader should be able to see the streams were not comparable without
+  // working it out from the environment blocks
+  out += ",\"environment_mismatches\":[";
+  bool first_mismatch = true;
+  for (size_t i = 1; i < streams.size(); ++i) {
+    for (const auto& m : EnvironmentMismatches(streams[0].environment, streams[i].environment)) {
+      if (!first_mismatch) out.push_back(',');
+      first_mismatch = false;
+      JsonEscapeTo(out, streams[i].label + " vs " + streams[0].label + ", " + m);
+    }
   }
   out += "]}\n";
   return out;

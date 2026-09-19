@@ -104,10 +104,36 @@ an epoch offset on every restart and hands the correlator a value that only
 increases. Arrival time is still used as a fallback when a stream carries no
 media position at all.
 
-Matching itself is a merge over both queues, and the decision only ever needs
-the front record of each side. If the earlier record is outside the tolerance
-window of the other side's front, no future record can be closer, so the record
-retires as unmatched rather than being paired with something unrelated.
+Matching itself is a merge over every queue, and the decision only ever needs
+the front record of each. If the earliest and the latest front are further
+apart than the tolerance, the earliest can never be matched by anything still
+to come, so it retires as unmatched rather than being grouped with something
+unrelated. Otherwise every front is close enough and the whole group is emitted
+together.
+
+That generalises to any number of streams without changing shape, which is what
+lets the cost pass compare four upscalers at once. A frame only counts when
+every stream has one close to it, so one stream out of step costs the group
+rather than a single pairing.
+
+## Saying how sure the numbers are
+
+Differences carry a 95% interval rather than a bare point estimate.
+
+The median delta uses a distribution free interval built from order statistics:
+the count of samples below a quantile is binomial, so the order statistics
+either side of its normal approximation bracket the quantile. That is exact
+under nothing more than independent samples, needs one sort rather than
+hundreds of resamples, and has no random seed, so the same data always gives
+the same interval. A bootstrap would also have worked and would have cost far
+more per refresh for a weaker guarantee.
+
+The share of frames where one stream is cheaper uses a Wilson score interval.
+The textbook normal interval misbehaves near zero and one, which is exactly
+where a shader comparison lands when one side wins almost every frame.
+
+An interval that straddles zero means the run did not separate the two, and the
+report says so instead of quoting the point estimate and staying quiet.
 
 Every comparative number comes from paired frames only. Comparing the two
 independent averages would be misleading, because the two instances can render

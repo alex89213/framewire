@@ -13,8 +13,10 @@ set -euo pipefail
 BUILD_DIR="${1:-build}"
 SOCK_A=/tmp/framewire-e2e-a-$$.sock
 SOCK_B=/tmp/framewire-e2e-b-$$.sock
+SOCK_C=/tmp/framewire-e2e-c-$$.sock
 SHM_A=/framewire-e2e-a-$$
 SHM_B=/framewire-e2e-b-$$
+SHM_C=/framewire-e2e-c-$$
 REPORT=$(mktemp /tmp/framewire-e2e-XXXXXX.json)
 DURATION=4
 FPS=120
@@ -23,8 +25,8 @@ PIDS=()
 cleanup() {
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
-  rm -f "$SOCK_A" "$SOCK_B" "$REPORT"
-  rm -f "/dev/shm${SHM_A}" "/dev/shm${SHM_B}" 2>/dev/null || true
+  rm -f "$SOCK_A" "$SOCK_B" "$SOCK_C" "$REPORT"
+  rm -f "/dev/shm${SHM_A}" "/dev/shm${SHM_B}" "/dev/shm${SHM_C}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -39,15 +41,21 @@ PIDS+=($!)
 "$BUILD_DIR/framewire-mock-mpv" --socket "$SOCK_B" --profile espcn-heavy --fps "$FPS" \
   --duration $((DURATION + 3)) --seed 22 2>/dev/null &
 PIDS+=($!)
+# a third stream, so the k way merge is exercised and not just the two way path
+"$BUILD_DIR/framewire-mock-mpv" --socket "$SOCK_C" --profile baseline --fps "$FPS" \
+  --duration $((DURATION + 3)) --seed 33 2>/dev/null &
+PIDS+=($!)
 sleep 0.5
 
 "$BUILD_DIR/framewire-producer" --socket "$SOCK_A" --shm "$SHM_A" --label light 2>/dev/null &
 PIDS+=($!)
 "$BUILD_DIR/framewire-producer" --socket "$SOCK_B" --shm "$SHM_B" --label heavy 2>/dev/null &
 PIDS+=($!)
+"$BUILD_DIR/framewire-producer" --socket "$SOCK_C" --shm "$SHM_C" --label plain 2>/dev/null &
+PIDS+=($!)
 sleep 0.5
 
-"$BUILD_DIR/framewire" --shm-a "$SHM_A" --shm-b "$SHM_B" \
+"$BUILD_DIR/framewire" --shm "$SHM_A" --shm "$SHM_B" --shm "$SHM_C" \
   --duration "$DURATION" --plain --json "$REPORT" >/dev/null 2>&1
 
 [[ -s "$REPORT" ]] || fail "no json report was written"
@@ -59,33 +67,43 @@ import json, sys
 doc = json.load(open(sys.argv[1]))
 problems = []
 
-if doc.get("schema") != "framewire.cost.v1":
+if doc.get("schema") != "framewire.cost.v2":
     problems.append(f"unexpected schema {doc.get('schema')}")
 
-for side in ("a", "b"):
-    s = doc[side]
+streams = doc.get("streams", [])
+if len(streams) != 3:
+    problems.append(f"expected 3 streams, got {len(streams)}")
+
+for s in streams:
+    who = s["label"]
     if s["frames"] < 100:
-        problems.append(f"{side}: only {s['frames']} frames captured, expected a few hundred")
+        problems.append(f"{who}: only {s['frames']} frames captured")
     for counter in ("ring_lost", "checksum_errors", "sequence_gaps"):
         if s[counter] != 0:
-            problems.append(f"{side}: {counter} is {s[counter]}, capture was not lossless")
+            problems.append(f"{who}: {counter} is {s[counter]}, capture was not lossless")
     if not s["passes"]:
-        problems.append(f"{side}: no pass breakdown came through")
+        problems.append(f"{who}: no pass breakdown came through")
     if s["gpu_p50_ns"] <= 0:
-        problems.append(f"{side}: gpu p50 is {s['gpu_p50_ns']}")
+        problems.append(f"{who}: gpu p50 is {s['gpu_p50_ns']}")
 
 cmp = doc["comparison"]
-if cmp["paired"] < 100:
-    problems.append(f"only {cmp['paired']} frames paired")
-if cmp["unmatched_a"] + cmp["unmatched_b"] > cmp["paired"] * 0.05:
-    problems.append(f"too many unmatched: {cmp['unmatched_a']} / {cmp['unmatched_b']}")
+if cmp["grouped"] < 100:
+    problems.append(f"only {cmp['grouped']} frames grouped across all three streams")
+if sum(cmp["unmatched"]) > cmp["grouped"] * 0.05:
+    problems.append(f"too many unmatched: {cmp['unmatched']}")
 
-# the heavy profile really is heavier, so the comparison has to say so. this is
-# what catches a correlator that pairs the wrong frames
-if doc["a"]["gpu_p50_ns"] >= doc["b"]["gpu_p50_ns"]:
-    problems.append("the light profile did not measure cheaper than the heavy one")
-if cmp["gpu_delta_p50_ns"] <= 0:
-    problems.append(f"gpu delta should be positive, got {cmp['gpu_delta_p50_ns']}")
+by_label = {s["label"]: s for s in cmp["streams"]}
+if not by_label.get("light", {}).get("is_baseline"):
+    problems.append("the first --shm should be the baseline")
+
+# the profiles have known relative costs, so the ranking is checkable. this is
+# what catches a k way merge that groups the wrong frames together
+heavy = by_label.get("heavy", {})
+if heavy.get("delta_p50_ns", 0) <= 0:
+    problems.append(f"espcn-heavy should cost more than espcn, got {heavy.get('delta_p50_ns')}")
+if heavy.get("cheaper_fraction", 1.0) > 0.05:
+    problems.append(f"espcn-heavy should almost never be cheaper, got {heavy.get('cheaper_fraction')}")
+
 if doc.get("environment_mismatches"):
     problems.append(f"unexpected environment mismatch: {doc['environment_mismatches']}")
 
@@ -94,6 +112,7 @@ if problems:
         print(f"FAIL: {p}")
     sys.exit(1)
 
-print(f"end to end ok: {doc['a']['frames']} and {doc['b']['frames']} frames, "
-      f"{cmp['paired']} paired, no loss")
+print(f"end to end ok: {len(streams)} streams, "
+      f"{', '.join(str(s['frames']) for s in streams)} frames, "
+      f"{cmp['grouped']} grouped, no loss")
 CHECKS

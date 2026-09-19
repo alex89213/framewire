@@ -1,6 +1,6 @@
 /*
- * Description: Side by side comparison view drawn from the stream snapshots,
- *   plus the plain text report used when output is not a terminal.
+ * Description: Comparison view drawn from the stream snapshots, plus the plain
+ *   text and JSON reports.
  * Author: Alex Wu
  * Dependencies: framewire/stats.h, framewire/term.h
  * Usage:
@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "framewire/stats.h"
 #include "framewire/term.h"
@@ -27,18 +28,18 @@ struct DashboardState {
 /*
  * Draws the comparison dashboard into a screen buffer.
  *
- * Layout is chosen from the terminal width. A wide terminal gets the two
- * streams side by side, and a narrow one stacks them, so the view stays
- * readable in a split pane.
+ * Two streams get the side by side panel view, which has room for the full
+ * pass breakdown. More than two get a row per stream instead, because panels
+ * stop fitting and the per stream detail stops being the interesting part once
+ * there is a ranking to read.
  *
  * Args:
  *   screen: Destination screen buffer, already sized for the frame.
- *   a: Snapshot for the first stream.
- *   b: Snapshot for the second stream.
- *   cmp: Paired frame comparison.
+ *   streams: One snapshot per stream, baseline first.
+ *   cmp: Comparison across grouped frames.
  *   state: Elapsed time and view flags.
  */
-void RenderDashboard(Screen& screen, const StreamSnapshot& a, const StreamSnapshot& b,
+void RenderDashboard(Screen& screen, const std::vector<StreamSnapshot>& streams,
                      const ComparisonSnapshot& cmp, const DashboardState& state);
 
 /*
@@ -48,14 +49,13 @@ void RenderDashboard(Screen& screen, const StreamSnapshot& a, const StreamSnapsh
  * benchmark run leaves numbers behind in the scrollback.
  *
  * Args:
- *   a: Snapshot for the first stream.
- *   b: Snapshot for the second stream.
- *   cmp: Paired frame comparison.
+ *   streams: One snapshot per stream, baseline first.
+ *   cmp: Comparison across grouped frames.
  *   elapsed_ns: Wall time the run covered.
  * Returns:
  *   A multi line report.
  */
-std::string BuildTextReport(const StreamSnapshot& a, const StreamSnapshot& b,
+std::string BuildTextReport(const std::vector<StreamSnapshot>& streams,
                             const ComparisonSnapshot& cmp, uint64_t elapsed_ns);
 
 /*
@@ -65,14 +65,13 @@ std::string BuildTextReport(const StreamSnapshot& a, const StreamSnapshot& b,
  * scraping the text report with regular expressions.
  *
  * Args:
- *   a: Snapshot for the first stream.
- *   b: Snapshot for the second stream.
- *   cmp: Paired frame comparison.
+ *   streams: One snapshot per stream, baseline first.
+ *   cmp: Comparison across grouped frames.
  *   elapsed_ns: Wall time the run covered.
  * Returns:
  *   A JSON document ending in a newline.
  */
-std::string BuildJsonReport(const StreamSnapshot& a, const StreamSnapshot& b,
+std::string BuildJsonReport(const std::vector<StreamSnapshot>& streams,
                             const ComparisonSnapshot& cmp, uint64_t elapsed_ns);
 
 }  // namespace framewire

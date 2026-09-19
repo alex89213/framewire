@@ -1,0 +1,95 @@
+#
+# Description: Builds framewire with gcc and clang and runs the full test
+#   suite. Everything here is headless, so no GPU or display is needed.
+# Author: Alex Wu
+# Dependencies: ubuntu runner, cmake, ninja
+# Usage: runs on push and pull request
+#
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+
+    name: ${{ matrix.compiler }} ${{ matrix.build_type }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Configure
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            export CC=clang CXX=clang++
+          else
+            export CC=gcc CXX=g++
+          fi
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DFRAMEWIRE_WERROR=ON
+
+      - name: Build
+        run: cmake --build build -j
+
+      # the whole suite runs without a GPU, a display or a video file, which is
+      # the reason the mock mpv server exists
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Ring throughput smoke
+        run: |
+          ./build/framewire-stress --records 2000000 --capacity 4096 \
+            --shm /framewire-ci-$$ --no-verify
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread, undefined]
+
+    name: ${{ matrix.sanitizer }} sanitizer
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      # a lock free queue is exactly the kind of code where a race shows up
+      # under load and never in a unit test, so the thread sanitizer earns its
+      # place here more than anywhere else in the project
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-fsanitize=${{ matrix.sanitizer }} -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=${{ matrix.sanitizer }}"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
