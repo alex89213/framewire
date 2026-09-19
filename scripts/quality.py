@@ -174,6 +174,30 @@ def run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
+def probe_geometry(clip):
+    """
+    Opens one mpv window and reports the size the compositor actually gave it.
+
+    Window size is not portable. A tiling compositor sizes by layout, a floating
+    one by request, and neither honours what mpv asks for. Rather than fight
+    that, the experiment is sized to whatever comes back, which makes the
+    measurement exact on any of them.
+
+    Args:
+        clip: Any clip, only used to get a window on screen.
+    Returns:
+        A tuple of even width and height for the render area.
+    """
+    session = MpvSession(clip, [], 0)
+    try:
+        _, _, width, height = session.video_rect()
+    finally:
+        session.close()
+    # an odd dimension cannot be halved into an input clip, so round down and
+    # crop the capture to match
+    return width - (width % 2), height - (height % 2)
+
+
 def capture(spec, clip, start, frames, outdir):
     """
     Captures rendered frames for one configuration.
@@ -220,6 +244,10 @@ def crop_frames(paths, rect, outdir):
         The cropped paths.
     """
     left, top, width, height = rect
+    # crop to even dimensions so the capture matches the size the input clip was
+    # built as exactly half of
+    width -= width % 2
+    height -= height % 2
     os.makedirs(outdir, exist_ok=True)
     out = []
     for i, path in enumerate(paths):
@@ -317,12 +345,21 @@ def main():
                     help="framewire cost report to join against, by label")
     ap.add_argument("--print-label", default=None,
                     help="print the canonical label for a spec and exit")
+    ap.add_argument("--probe-geometry", default=None, metavar="CLIP",
+                    help="print the render area this compositor gives, as WxH, and exit")
+    ap.add_argument("--expect-geometry", default=None, metavar="WxH",
+                    help="fail unless every capture lands on this size")
     args = ap.parse_args()
 
     # the orchestrator needs the same label the results are keyed on, and
     # deriving it in two places would let them drift apart
     if args.print_label:
         print(parse_spec(args.print_label)[0])
+        return 0
+
+    if args.probe_geometry:
+        w, h = probe_geometry(args.probe_geometry)
+        print(f"{w}x{h}")
         return 0
 
     if not args.spec:
@@ -348,7 +385,17 @@ def main():
 
         label, rect, paths = capture(spec, args.input, args.start, args.frames, raw)
         cropped = crop_frames(paths, rect, crop)
-        _, _, width, height = rect
+        width = rect[2] - (rect[2] % 2)
+        height = rect[3] - (rect[3] % 2)
+
+        if args.expect_geometry:
+            want_w, want_h = (int(v) for v in args.expect_geometry.lower().split("x"))
+            if (width, height) != (want_w, want_h):
+                raise SystemExit(
+                    f"{label} rendered at {width}x{height} but the cost pass used "
+                    f"{want_w}x{want_h}. cost and quality would describe different "
+                    f"experiments, so the run is stopping rather than reporting a "
+                    f"number that looks comparable and is not")
 
         # every configuration has to be captured at the same size, otherwise the
         # scores describe different experiments and cannot be ranked together
@@ -454,6 +501,7 @@ def main():
                 "schema": "framewire.quality.v1",
                 "capture_width": geometry[0],
                 "capture_height": geometry[1],
+                "note": "scores are exact only when the input clip is half the capture size",
                 "results": results,
                 "cost": cost or None,
             }, f, indent=2)

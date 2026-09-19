@@ -159,13 +159,29 @@ Two guards matter. Every configuration must capture at the same geometry or the
 run aborts, since scores from different sizes are not comparable. And the
 capture geometry is printed rather than hidden.
 
-One honest limitation: the capture size is whatever the compositor gives the
-window. On a compositor that ignores `--geometry`, the shader output gets
-resampled to the window size before capture, which adds a small uniform blur to
-every configuration. That compresses the differences between shaders but does
-not reorder them, so the ranking holds while the absolute numbers are specific
-to the machine. Running the capture under a fixed size surface, for example
-`cage` or `Xvfb`, removes the caveat entirely.
+### Sizing the experiment to the desktop
+
+Window size is not portable and cannot be made portable. A tiling compositor
+sizes windows by layout, a floating one by request, and neither reliably
+honours what mpv asks for. On the scrolling compositor this was developed
+against, every geometry flag mpv has is ignored outright.
+
+Fighting that is a losing game, so the experiment is sized to it instead.
+`scripts/compare.sh` opens one throwaway window, reads the render area back
+through `osd-dimensions`, and builds the clips as exactly half of it. A 2x
+shader then lands on the render target at a scale factor of exactly 1.0, which
+is an identity, so nothing is resampled between the shader and the capture. The
+measurement is exact on whatever desktop it runs on, and the geometry is
+recorded in the output so two runs can be checked for comparability.
+
+Both passes are then pinned to that geometry. The quality pass takes
+`--expect-geometry` and refuses to run if a capture lands anywhere else, since
+cost and quality measured at different render sizes are two experiments, not
+one.
+
+This also removes any need for a nested compositor. Running under `gamescope`
+or `cage` would fix the size, but it is not required, and `Xvfb` would actively
+be wrong here because software rendering makes the cost half meaningless.
 
 PSNR and SSIM also disagree more often than people expect. In the runs above
 FSRCNNX scores the highest PSNR of any configuration while scoring the lowest
@@ -491,6 +507,30 @@ each run pairs two mpv instances side by side for 20 seconds with
 | espcn_x2_8 | FSRCNNX_x2_8 | 4.17ms | 5.70ms | +1.51ms | 99.8% |
 | espcn_x2_8 | FSRCNNX_x2_16 | 5.14ms | 10.08ms | +4.73ms | 99.8% |
 | FSR | NVScaler | 2.34ms | 4.41ms | +2.04ms | 99.8% |
+
+Read the shader against built in scaler rows with care. These were taken before
+the experiment was sized to the render area, so the source needed a 2.65x
+upscale while every shader here only supplies 2x. A custom shader therefore did
+its 2x and handed the remainder to a cheap bilinear finish, while a built in
+scaler did the entire 2.65x with its own expensive filter. That is not the same
+amount of work.
+
+Shader against shader rows are unaffected, since both sides supply 2x and both
+hand off the same remainder.
+
+Re-running espcn against `ewa_lanczossharp` at an exact 2x, where both do the
+same job, gives a very different and much less flattering picture:
+
+| Config | GPU p50 | GPU p99 | PSNR dB | SSIM |
+| --- | --- | --- | --- | --- |
+| espcn_x2_8 | 820us | 2.21ms | 45.991 | 0.9082 |
+| ewa_lanczossharp | 896us | 3.51ms | 46.082 | 0.9101 |
+
+Roughly tied on median cost and tied on quality, with the interesting
+difference in the tail: the shader's p99 is 2.21ms against 3.51ms, so it is the
+more predictable of the two. An earlier run of the same pair reported the
+shader as three times cheaper, and that number was an artefact of the unfair
+setup above.
 
 Chain lengths differ a lot more than the file sizes suggest:
 

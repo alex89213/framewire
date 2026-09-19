@@ -18,10 +18,10 @@ SOURCE="${1:-}"
 SPEC_A="${2:-}"
 SPEC_B="${3:-}"
 
-# the cost pass and the quality pass have to describe the same experiment, so
-# both run on the same input clip at the same upscale factor
-TARGET_W="${TARGET_W:-960}"
-TARGET_H="${TARGET_H:-540}"
+# the render size is whatever the compositor hands out, and that is not
+# portable: a tiling compositor sizes by layout, a floating one by request.
+# rather than fight it, the experiment is sized to it, so the shader lands on
+# the render target exactly and nothing is resampled on any desktop
 CLIP_START="${CLIP_START:-60}"
 CLIP_LENGTH="${CLIP_LENGTH:-12}"
 COST_SECONDS="${COST_SECONDS:-20}"
@@ -38,7 +38,6 @@ usage: scripts/compare.sh SOURCE_VIDEO SPEC_A SPEC_B
     none                             mpv defaults
 
 environment:
-  TARGET_W, TARGET_H   upscale target, default 960x540
   CLIP_START           seconds into the source to sample, default 60
   CLIP_LENGTH          clip length in seconds, default 12
   COST_SECONDS         how long the live cost pass runs, default 20
@@ -64,22 +63,38 @@ done
 LABEL_A="$(python3 "$QUALITY" --print-label "$SPEC_A")"
 LABEL_B="$(python3 "$QUALITY" --print-label "$SPEC_B")"
 
-HALF_W=$((TARGET_W / 2))
-HALF_H=$((TARGET_H / 2))
-REF="$WORKDIR/ref_${TARGET_W}x${TARGET_H}.mkv"
-IN="$WORKDIR/in_${HALF_W}x${HALF_H}.mkv"
 COST_JSON="$(mktemp /tmp/framewire-cost-XXXXXX.json)"
-
 mkdir -p "$WORKDIR"
 
-# the reference is encoded losslessly, so the ground truth is not already
-# degraded before anything is compared against it
+# a throwaway clip just to get a window on screen and read its size back
+PROBE="$WORKDIR/.probe.mkv"
+if [[ ! -f "$PROBE" ]]; then
+  ffmpeg -y -v error -ss "$CLIP_START" -i "$SOURCE" -t 1 -vf "scale=320:180" \
+    -c:v libx264 -preset ultrafast -an "$PROBE"
+fi
+
+echo "probing the render size this compositor gives mpv"
+GEOMETRY="$(python3 "$QUALITY" --probe-geometry "$PROBE")"
+TARGET_W="${GEOMETRY%x*}"
+TARGET_H="${GEOMETRY#*x}"
+HALF_W=$((TARGET_W / 2))
+HALF_H=$((TARGET_H / 2))
+echo "  render area ${TARGET_W}x${TARGET_H}, so the experiment is ${HALF_W}x${HALF_H} upscaled 2x"
+echo
+
+REF="$WORKDIR/ref_${TARGET_W}x${TARGET_H}.mkv"
+IN="$WORKDIR/in_${HALF_W}x${HALF_H}.mkv"
+
+# lossless and 4:4:4, so the ground truth is not degraded before anything is
+# compared against it, and so an odd half width is still encodable
 if [[ ! -f "$REF" || ! -f "$IN" ]]; then
   echo "preparing clips from $SOURCE"
   ffmpeg -y -v error -ss "$CLIP_START" -i "$SOURCE" -t "$CLIP_LENGTH" \
-    -vf "scale=${TARGET_W}:${TARGET_H}:flags=lanczos" -c:v libx264 -qp 0 -preset veryfast -an "$REF"
+    -vf "scale=${TARGET_W}:${TARGET_H}:flags=lanczos" \
+    -c:v libx264 -qp 0 -pix_fmt yuv444p -preset veryfast -an "$REF"
   ffmpeg -y -v error -i "$REF" \
-    -vf "scale=${HALF_W}:${HALF_H}:flags=lanczos" -c:v libx264 -qp 0 -preset veryfast -an "$IN"
+    -vf "scale=${HALF_W}:${HALF_H}:flags=lanczos" \
+    -c:v libx264 -qp 0 -pix_fmt yuv444p -preset veryfast -an "$IN"
 fi
 echo "  reference $REF  input $IN"
 echo
@@ -150,6 +165,7 @@ python3 "$QUALITY" \
   --reference "$REF" --input "$IN" \
   --spec "$SPEC_A" --spec "$SPEC_B" \
   --frames "$QUALITY_FRAMES" --start 2 \
+  --expect-geometry "$GEOMETRY" \
   --cost-json "$COST_JSON"
 
 rm -f "$COST_JSON"
