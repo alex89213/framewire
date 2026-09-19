@@ -23,6 +23,28 @@ The harness runs in two modes, because one number cannot answer both questions.
 | 16384 | 156.4 | 28635 | 6.39 |
 | 65536 | 168.9 | 30918 | 5.92 |
 
+**Per operation latency**, measured with the time stamp counter rather than
+`clock_gettime`, because the portable clock costs more than the operation being
+measured. The cost of a back to back counter read is measured and subtracted
+from every sample:
+
+| Operation | p50 | p99 | p999 | max |
+| --- | --- | --- | --- | --- |
+| push | 6 ns | 12 ns | 23 ns | 99 us |
+| pop | 6 ns | 8 ns | 12 ns | 28 us |
+
+Read those two columns differently. The median sits near the measurement floor,
+so treat it as an upper bound rather than a precise figure. The tail is real and
+is the more interesting half: p999 at 23 ns says the queue itself has almost no
+spread, and the maximum in the tens of microseconds is the scheduler taking the
+core away mid operation, not anything the queue did. A run pinned to an isolated
+core would cut that maximum and leave the rest unchanged.
+
+Reproduce with `--latency`, which times each operation individually. The pop
+path is timed one record at a time there rather than batched, since a batched
+pop amortises the acquire load away, which is right in production and wrong when
+the question is what one dequeue costs.
+
 **Integrity mode** rebuilds every record from its sequence number and compares
 it byte for byte, so a torn read that mixed two records would be caught even if
 both halves were individually valid:

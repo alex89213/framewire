@@ -7,6 +7,11 @@
  * Usage: framewire-stress --records 20000000 --capacity 4096
  */
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <x86intrin.h>
+#define FRAMEWIRE_HAVE_RDTSC 1
+#endif
+
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -20,6 +25,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "framewire/histogram.h"
 #include "framewire/spsc_ring.h"
 #include "framewire/telemetry.h"
 
@@ -32,6 +38,70 @@ using namespace framewire;
 constexpr uint64_t kStallLimitNs = 10ull * 1000 * 1000 * 1000;
 constexpr uint64_t kProducerSilenceNs = 5ull * 1000 * 1000 * 1000;
 
+/*
+ * Cycle counter used to time a single queue operation.
+ *
+ * clock_gettime is the portable choice and costs more than the operation being
+ * measured, which would bury the result. The time stamp counter is invariant on
+ * anything modern, so it is calibrated against the monotonic clock once and
+ * then read directly.
+ *
+ * The cost of a back to back read is measured too and subtracted from every
+ * sample. At these timescales the measurement floor is a real fraction of the
+ * result, so leaving it in would overstate every number.
+ */
+class TscClock {
+ public:
+  bool Calibrate() {
+#ifdef FRAMEWIRE_HAVE_RDTSC
+    const uint64_t wall_start = MonotonicNanos();
+    const uint64_t tsc_start = __rdtsc();
+    const timespec nap{0, 50 * 1000 * 1000};
+    nanosleep(&nap, nullptr);
+    const uint64_t tsc_end = __rdtsc();
+    const uint64_t wall_end = MonotonicNanos();
+
+    const double elapsed_ns = static_cast<double>(wall_end - wall_start);
+    if (elapsed_ns <= 0.0) return false;
+    ticks_per_ns_ = static_cast<double>(tsc_end - tsc_start) / elapsed_ns;
+
+    // the floor is the smallest observed gap between two adjacent reads, which
+    // is as close to zero work as the counter can resolve
+    uint64_t floor = ~0ull;
+    for (int i = 0; i < 200000; ++i) {
+      const uint64_t a = __rdtsc();
+      const uint64_t b = __rdtsc();
+      if (b - a < floor) floor = b - a;
+    }
+    floor_ticks_ = floor;
+    return ticks_per_ns_ > 0.1;
+#else
+    return false;
+#endif
+  }
+
+  uint64_t Now() const {
+#ifdef FRAMEWIRE_HAVE_RDTSC
+    return __rdtsc();
+#else
+    return 0;
+#endif
+  }
+
+  // Converts a raw tick span into nanoseconds, with the read cost removed.
+  uint64_t SpanNanos(uint64_t ticks) const {
+    const uint64_t net = ticks > floor_ticks_ ? ticks - floor_ticks_ : 0;
+    return static_cast<uint64_t>(static_cast<double>(net) / ticks_per_ns_);
+  }
+
+  double ticks_per_ns() const { return ticks_per_ns_; }
+  uint64_t floor_ticks() const { return floor_ticks_; }
+
+ private:
+  double ticks_per_ns_ = 0.0;
+  uint64_t floor_ticks_ = 0;
+};
+
 struct Options {
   uint64_t records = 20000000;
   uint32_t capacity = 4096;
@@ -40,6 +110,7 @@ struct Options {
   unsigned slow_producer_every = 0;
   bool quiet = false;
   bool verify = true;  // off measures the queue itself rather than the checks
+  bool latency = false;  // time every operation instead of only the total
 };
 
 /*
@@ -59,6 +130,17 @@ struct Results {
   std::atomic<uint64_t> producer_ns;
   std::atomic<uint64_t> consumer_ns;
   std::atomic<uint64_t> consumer_ready;
+
+  // per operation latency, in nanoseconds, filled in only for a latency run
+  std::atomic<uint64_t> push_p50;
+  std::atomic<uint64_t> push_p99;
+  std::atomic<uint64_t> push_p999;
+  std::atomic<uint64_t> push_max;
+  std::atomic<uint64_t> pop_p50;
+  std::atomic<uint64_t> pop_p99;
+  std::atomic<uint64_t> pop_p999;
+  std::atomic<uint64_t> pop_max;
+  std::atomic<uint64_t> tsc_floor_ticks;
 };
 
 void PrintUsage() {
@@ -71,6 +153,7 @@ void PrintUsage() {
                "  --slow-consumer N stall the consumer every N records\n"
                "  --slow-producer N stall the producer every N records\n"
                "  --no-verify       skip checksums and payload rebuild, to time the queue\n"
+               "  --latency         report per operation p50, p99, p999 and max\n"
                "  --quiet           only print the verdict\n");
 }
 
@@ -140,6 +223,12 @@ void RunProducer(const Options& opt, Results* results) {
     nanosleep(&nap, nullptr);
   }
 
+  TscClock tsc;
+  const bool timing = opt.latency && tsc.Calibrate();
+  // a wide range because the tail is the point. a scheduler preemption in the
+  // middle of a push lands in the hundreds of microseconds
+  Histogram push_latency(1000000000ull, 3);
+
   const uint64_t start = MonotonicNanos();
   uint64_t produced = 0;
   uint64_t dropped = 0;
@@ -163,6 +252,23 @@ void RunProducer(const Options& opt, Results* results) {
     // consumer sees a stale stamp, decides the producer died and exits early,
     // which only shows up on runs longer than the staleness window
     if ((seq & 0xFFF) == 0) producer.Heartbeat();
+
+    // the timed push is the uncontended path only. a push that has to wait for
+    // the consumer is backpressure, not queue cost, so it is excluded below
+    if (timing) {
+      const uint64_t t0 = tsc.Now();
+      const bool ok = producer.TryPush(rec);
+      const uint64_t t1 = tsc.Now();
+      if (ok) {
+        push_latency.Record(tsc.SpanNanos(t1 - t0));
+        ++produced;
+        if (opt.slow_producer_every != 0 && produced % opt.slow_producer_every == 0) {
+          const timespec nap{0, 50000};
+          nanosleep(&nap, nullptr);
+        }
+        continue;
+      }
+    }
 
     // retry rather than drop, so a completed run has a known record count and
     // any missing record is a real defect instead of expected backpressure
@@ -205,6 +311,14 @@ void RunProducer(const Options& opt, Results* results) {
 
   results->produced.store(produced, std::memory_order_relaxed);
   results->dropped.store(dropped, std::memory_order_relaxed);
+
+  if (timing && push_latency.count() > 0) {
+    results->push_p50.store(push_latency.ValueAtQuantile(0.50), std::memory_order_relaxed);
+    results->push_p99.store(push_latency.ValueAtQuantile(0.99), std::memory_order_relaxed);
+    results->push_p999.store(push_latency.ValueAtQuantile(0.999), std::memory_order_relaxed);
+    results->push_max.store(push_latency.max(), std::memory_order_relaxed);
+    results->tsc_floor_ticks.store(tsc.floor_ticks(), std::memory_order_relaxed);
+  }
   results->producer_ns.store(elapsed, std::memory_order_release);
 }
 
@@ -225,10 +339,43 @@ void RunConsumer(const Options& opt, Results* results) {
   uint64_t gap_records = 0;
   uint64_t last_seq = 0;
 
+  TscClock tsc;
+  const bool timing = opt.latency && tsc.Calibrate();
+  Histogram pop_latency(1000000000ull, 3);
+
   constexpr size_t kBatch = 256;
   TelemetryRecord batch[kBatch];
 
   for (;;) {
+    if (timing) {
+      // one record at a time here on purpose. a batched pop amortises the
+      // acquire load away, which is the right thing to do in production and the
+      // wrong thing when the question is what a single dequeue costs
+      TelemetryRecord one;
+      const uint64_t t0 = tsc.Now();
+      const bool ok = consumer.TryPop(one);
+      const uint64_t t1 = tsc.Now();
+      if (ok) {
+        pop_latency.Record(tsc.SpanNanos(t1 - t0));
+        if (opt.verify) {
+          if (!VerifyChecksum(one)) ++checksum_errors;
+          if (!PayloadMatches(one)) ++payload_errors;
+        }
+        if (last_seq != 0) {
+          if (one.seq <= last_seq) {
+            ++order_errors;
+          } else if (one.seq != last_seq + 1) {
+            gap_records += one.seq - last_seq - 1;
+          }
+        }
+        last_seq = one.seq;
+        ++consumed;
+        continue;
+      }
+      if (consumer.ProducerGone(kProducerSilenceNs) && consumer.PendingCount() == 0) break;
+      continue;
+    }
+
     const size_t n = consumer.PopBatch(batch, kBatch);
     if (n == 0) {
       if (consumer.ProducerGone(kProducerSilenceNs) && consumer.PendingCount() == 0) break;
@@ -268,6 +415,13 @@ void RunConsumer(const Options& opt, Results* results) {
   results->payload_errors.store(payload_errors, std::memory_order_relaxed);
   results->order_errors.store(order_errors, std::memory_order_relaxed);
   results->gap_records.store(gap_records, std::memory_order_relaxed);
+
+  if (timing && pop_latency.count() > 0) {
+    results->pop_p50.store(pop_latency.ValueAtQuantile(0.50), std::memory_order_relaxed);
+    results->pop_p99.store(pop_latency.ValueAtQuantile(0.99), std::memory_order_relaxed);
+    results->pop_p999.store(pop_latency.ValueAtQuantile(0.999), std::memory_order_relaxed);
+    results->pop_max.store(pop_latency.max(), std::memory_order_relaxed);
+  }
   results->consumer_ns.store(elapsed, std::memory_order_release);
 }
 
@@ -356,6 +510,25 @@ int Run(const Options& opt) {
                                                        : 0.0);
   std::printf("  full ring waits %" PRIu64 "\n\n", backpressure);
 
+  if (opt.latency) {
+    const uint64_t floor_ticks = results->tsc_floor_ticks.load(std::memory_order_relaxed);
+    std::printf("per operation latency\n");
+    std::printf("  %-10s %10s %10s %10s %10s\n", "op", "p50", "p99", "p999", "max");
+    std::printf("  %-10s %9llu %9llu %9llu %9llu\n", "push ns",
+                (unsigned long long)results->push_p50.load(),
+                (unsigned long long)results->push_p99.load(),
+                (unsigned long long)results->push_p999.load(),
+                (unsigned long long)results->push_max.load());
+    std::printf("  %-10s %9llu %9llu %9llu %9llu\n", "pop ns",
+                (unsigned long long)results->pop_p50.load(),
+                (unsigned long long)results->pop_p99.load(),
+                (unsigned long long)results->pop_p999.load(),
+                (unsigned long long)results->pop_max.load());
+    std::printf("  timed with rdtsc, %llu tick read cost already subtracted.\n",
+                (unsigned long long)floor_ticks);
+    std::printf("  the median sits near the measurement floor, the tail is real.\n\n");
+  }
+
   std::printf("integrity\n");
   std::printf("  checksum errors %" PRIu64 "\n", checksum_errors);
   std::printf("  payload errors  %" PRIu64 "\n", payload_errors);
@@ -407,6 +580,8 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
       opt->slow_producer_every = static_cast<unsigned>(std::strtoul(v, nullptr, 10));
     } else if (arg == "--no-verify") {
       opt->verify = false;
+    } else if (arg == "--latency") {
+      opt->latency = true;
     } else if (arg == "--quiet") {
       opt->quiet = true;
     } else if (arg == "--help" || arg == "-h") {
