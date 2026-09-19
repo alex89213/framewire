@@ -8,6 +8,8 @@
 
 #include "framewire/dashboard.h"
 
+#include "framewire/json.h"
+
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
@@ -318,6 +320,60 @@ std::string BuildTextReport(const StreamSnapshot& a, const StreamSnapshot& b,
                 d.name.empty() ? "(unnamed)" : d.name.c_str(), FormatNanos(d.a_p50).c_str(),
                 FormatNanos(d.b_p50).c_str(), FormatSignedNanos(d.delta_p50).c_str()));
   }
+  return out;
+}
+
+
+
+std::string BuildJsonReport(const StreamSnapshot& a, const StreamSnapshot& b,
+                            const ComparisonSnapshot& cmp, uint64_t elapsed_ns) {
+  std::string out;
+
+  auto stream_object = [](const StreamSnapshot& s) {
+    std::string o = "{\"label\":";
+    JsonEscapeTo(o, s.label);
+    o += Format(",\"frames\":%llu", static_cast<unsigned long long>(s.records));
+    o += Format(",\"fps\":%.4f", s.fps);
+    o += Format(",\"gpu_p50_ns\":%llu", static_cast<unsigned long long>(s.gpu_life.p50));
+    o += Format(",\"gpu_p99_ns\":%llu", static_cast<unsigned long long>(s.gpu_life.p99));
+    o += Format(",\"gpu_p999_ns\":%llu", static_cast<unsigned long long>(s.gpu_life.p999));
+    o += Format(",\"gpu_max_ns\":%llu", static_cast<unsigned long long>(s.gpu_life.max));
+    o += Format(",\"gpu_mean_ns\":%.1f", s.gpu_mean);
+    o += Format(",\"frame_p50_ns\":%llu", static_cast<unsigned long long>(s.frame_time_life.p50));
+    o += Format(",\"frame_p99_ns\":%llu", static_cast<unsigned long long>(s.frame_time_life.p99));
+    o += Format(",\"dropped\":%llu", static_cast<unsigned long long>(s.dropped_frames));
+    o += Format(",\"delayed\":%llu", static_cast<unsigned long long>(s.delayed_frames));
+    o += Format(",\"ring_lost\":%llu", static_cast<unsigned long long>(s.producer_drops));
+    o += Format(",\"checksum_errors\":%llu", static_cast<unsigned long long>(s.checksum_errors));
+    o += Format(",\"sequence_gaps\":%llu", static_cast<unsigned long long>(s.sequence_gaps));
+
+    o += ",\"passes\":[";
+    for (size_t i = 0; i < s.passes.size(); ++i) {
+      if (i != 0) o.push_back(',');
+      o += "{\"name\":";
+      JsonEscapeTo(o, s.passes[i].name);
+      o += Format(",\"p50_ns\":%llu", static_cast<unsigned long long>(s.passes[i].p50));
+      o += Format(",\"p99_ns\":%llu", static_cast<unsigned long long>(s.passes[i].p99));
+      o += Format(",\"samples\":%llu", static_cast<unsigned long long>(s.passes[i].samples));
+      o.push_back('}');
+    }
+    o += "]}";
+    return o;
+  };
+
+  out += "{\"schema\":\"framewire.cost.v1\"";
+  out += Format(",\"elapsed_ns\":%llu", static_cast<unsigned long long>(elapsed_ns));
+  out += ",\"a\":" + stream_object(a);
+  out += ",\"b\":" + stream_object(b);
+  out += ",\"comparison\":{";
+  out += Format("\"paired\":%llu", static_cast<unsigned long long>(cmp.paired));
+  out += Format(",\"unmatched_a\":%llu", static_cast<unsigned long long>(cmp.unmatched_a));
+  out += Format(",\"unmatched_b\":%llu", static_cast<unsigned long long>(cmp.unmatched_b));
+  out += Format(",\"gpu_delta_p50_ns\":%lld", static_cast<long long>(cmp.gpu_delta_p50));
+  out += Format(",\"gpu_delta_p99_ns\":%lld", static_cast<long long>(cmp.gpu_delta_p99));
+  out += Format(",\"a_faster_fraction\":%.6f", cmp.a_faster_fraction);
+  out += Format(",\"speedup_a_over_b\":%.6f", cmp.speedup);
+  out += "}}\n";
   return out;
 }
 

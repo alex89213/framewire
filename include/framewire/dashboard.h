@@ -58,4 +58,21 @@ void RenderDashboard(Screen& screen, const StreamSnapshot& a, const StreamSnapsh
 std::string BuildTextReport(const StreamSnapshot& a, const StreamSnapshot& b,
                             const ComparisonSnapshot& cmp, uint64_t elapsed_ns);
 
+/*
+ * Builds the same report as JSON.
+ *
+ * Exists so a quality pass can join against cost numbers by key instead of
+ * scraping the text report with regular expressions.
+ *
+ * Args:
+ *   a: Snapshot for the first stream.
+ *   b: Snapshot for the second stream.
+ *   cmp: Paired frame comparison.
+ *   elapsed_ns: Wall time the run covered.
+ * Returns:
+ *   A JSON document ending in a newline.
+ */
+std::string BuildJsonReport(const StreamSnapshot& a, const StreamSnapshot& b,
+                            const ComparisonSnapshot& cmp, uint64_t elapsed_ns);
+
 }  // namespace framewire

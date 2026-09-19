@@ -37,6 +37,9 @@ the built in scaler, and where does the difference land in the pass breakdown.
 
 Requires a C++20 compiler and CMake 3.16 or newer. Nothing else.
 
+The optional quality pass additionally needs `mpv`, `ffmpeg` and `python3`. The
+tool itself needs none of them.
+
 ```sh
 cmake -S . -B build -G Ninja
 cmake --build build -j
@@ -83,6 +86,90 @@ Useful environment variables:
 | `LABEL_A`, `LABEL_B` | panel labels, default to the shader file names |
 | `DURATION` | stop after this many seconds and print the report |
 | `BUILD_DIR` | where the binaries live, defaults to `build` |
+
+### Cost and quality in one run
+
+`scripts/compare.sh` runs both halves and prints one table. The live cost
+dashboard comes up first, then the quality pass runs, then the two are joined.
+
+```sh
+scripts/compare.sh movie.mkv shader:espcn_x2_8.glsl builtin:ewa_lanczossharp
+```
+
+A configuration is given as `shader:PATH` for a custom GLSL shader,
+`builtin:NAME` for one of mpv's own scalers, or `none` for mpv defaults. Both
+passes run on the same clip at the same upscale factor, so the joined table
+describes one experiment rather than two.
+
+Output ends like this:
+
+```
+  cost and quality together
+  config                          GPU p50    GPU p99   PSNR dB     SSIM
+  ---------------------------- ---------- ---------- --------- --------
+  ewa_lanczossharp                 1.65ms     3.62ms    46.525   0.9860
+  espcn_x2_8                       0.53ms     1.27ms    46.506   0.9883
+
+  quality is a wash: 0.02 dB apart, inside the 0.39 dB frame to frame spread
+  espcn_x2_8 costs 3.09x less GPU time for the same picture, so it wins on cost alone
+```
+
+The verdict compares the quality gap against the frame to frame spread rather
+than against a fixed threshold. A 0.02 dB difference across 8 frames that vary
+by 0.39 dB between themselves is not a result, and calling it one would be the
+same mistake as quoting a truncated pass total.
+
+Every mpv instance is launched with `--no-config`. A user `mpv.conf` can set a
+scaler, a shader or a profile that would change the measurement without
+appearing anywhere in the output.
+
+### How the quality pass works
+
+Quality cannot ride the same path as cost, for two reasons. Cost is a runtime
+property that moves with load and contention, so it has to be sampled live.
+Quality is a deterministic function of the shader and the input frame, so there
+is nothing to gain from measuring it in real time. More to the point, computing
+quality during a cost run would ruin the cost run, because reading the
+framebuffer back from the GPU is a synchronisation point that stalls the very
+pipeline being timed. Separating the two passes is required, not a compromise.
+
+Getting shader output out of mpv is the awkward part, and two of the three
+obvious routes silently do not work:
+
+| Route | Applies GLSL shaders |
+| --- | --- |
+| `--o=out.mkv`, the encoder | no |
+| `--vo=image` | no |
+| screenshot of the rendered window | yes |
+
+Both failing routes produce output that looks right and is pixel identical to
+the unshaded version. The encoder case is worse than it sounds, because the two
+files differ in md5 through container metadata, so a checksum comparison says
+the shader worked. Only comparing decoded pixels shows MSE zero.
+
+So capture goes through a real rendered window: one paused mpv instance per
+configuration, advanced with `frame-step` rather than by seeking, since a seek
+can round to a keyframe and shift the alignment. Each frame is screenshotted,
+cropped to the video rectangle mpv reports through `osd-dimensions`, and scored
+against a reference with ffmpeg's `psnr` and `ssim` filters. The offset between
+capture and reference is measured once from the first frame and reused, because
+mpv and ffmpeg can disagree by a frame about where a start position lands.
+
+Two guards matter. Every configuration must capture at the same geometry or the
+run aborts, since scores from different sizes are not comparable. And the
+capture geometry is printed rather than hidden.
+
+One honest limitation: the capture size is whatever the compositor gives the
+window. On a compositor that ignores `--geometry`, the shader output gets
+resampled to the window size before capture, which adds a small uniform blur to
+every configuration. That compresses the differences between shaders but does
+not reorder them, so the ranking holds while the absolute numbers are specific
+to the machine. Running the capture under a fixed size surface, for example
+`cage` or `Xvfb`, removes the caveat entirely.
+
+PSNR and SSIM also disagree more often than people expect. In the runs above
+FSRCNNX scores the highest PSNR of any configuration while scoring the lowest
+SSIM, because it sharpens in a way PSNR rewards and SSIM does not. Report both.
 
 ### Without a GPU
 

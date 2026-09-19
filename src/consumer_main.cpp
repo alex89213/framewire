@@ -33,6 +33,7 @@ struct Options {
   std::string label_a;
   std::string label_b;
   std::string report_path;
+  std::string json_path;
   double refresh_hz = 10.0;
   double tolerance_ms = 8.0;
   double duration_s = 0.0;  // zero runs until interrupted
@@ -54,6 +55,7 @@ void PrintUsage() {
                "  --duration S      stop after S seconds, then print the report\n"
                "  --wait MS         how long to wait for the producers (default 15000)\n"
                "  --report PATH     also write the final report to a file\n"
+               "  --json PATH       write the final report as JSON, for joining with other runs\n"
                "  --no-color        plain output with no escape codes\n"
                "  --plain           skip the live view, print the report at exit\n");
 }
@@ -105,6 +107,10 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
       const char* v = next("--report");
       if (!v) return false;
       opt->report_path = v;
+    } else if (arg == "--json") {
+      const char* v = next("--json");
+      if (!v) return false;
+      opt->json_path = v;
     } else if (arg == "--no-color") {
       opt->color = false;
     } else if (arg == "--plain") {
@@ -292,6 +298,17 @@ int Run(const Options& opt) {
   const std::string report =
       BuildTextReport(snap_a, snap_b, snap_cmp, MonotonicNanos() - start);
   std::fputs(report.c_str(), stdout);
+
+  if (!opt.json_path.empty()) {
+    const std::string json = BuildJsonReport(snap_a, snap_b, snap_cmp, MonotonicNanos() - start);
+    FILE* f = std::fopen(opt.json_path.c_str(), "w");
+    if (f == nullptr) {
+      std::fprintf(stderr, "framewire: could not write %s\n", opt.json_path.c_str());
+    } else {
+      std::fputs(json.c_str(), f);
+      std::fclose(f);
+    }
+  }
 
   if (!opt.report_path.empty()) {
     FILE* f = std::fopen(opt.report_path.c_str(), "w");

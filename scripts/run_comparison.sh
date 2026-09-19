@@ -78,6 +78,12 @@ start_mpv() {
   local args=(
     --input-ipc-server="$socket"
     --vo="$VO"
+    # a user mpv.conf can set a scaler, a shader or a profile that would
+    # silently change the result without appearing anywhere in the output
+    --no-config
+    --no-resume-playback
+    --no-osc
+    --osd-level=0
     --no-audio
     --keep-open=no
     --loop-file=inf
